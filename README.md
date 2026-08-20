@@ -52,15 +52,25 @@ and live commentary at http://localhost:8765 :
 
 Seat specs: `llm:<openrouter-slug>`, plus free scripted baselines `random`,
 `weighted`, `vp`. 2-4 seats per game. Standings print wins, turns, token usage,
-fallback counts, and exact dollar cost per seat.
+retry counts, and exact dollar cost per seat.
 
 ## How it works
 
 The engine enumerates legal actions each step. For every multi-option decision,
 the seat's model gets a compact state summary plus a numbered action list and
-replies with JSON `{"reason", "action_index"}`. Forced moves skip the API. Any
-failure (API error, unparseable reply, bad index) becomes a random legal move
-and is counted, so contaminated games are visible in the standings.
+replies with JSON `{"reason", "action_index"}`. Forced moves skip the API.
+
+**Every move is the model's own.** A failed call (timeout, API error,
+unparseable reply, bad index) is never replaced by a random move — it is
+retried, with the per-attempt deadline escalating from 20s to a 120s ceiling,
+until the model answers. Retries are logged and shown against the decision they
+delayed. Only a permanently fatal setup error (bad key, no credit, malformed
+request) stops a match, with exit code 3 so the supervisor doesn't loop.
+
+Caveat on cost: a call that misses its deadline was still generated, and so
+still billed, but its usage is not counted — measured on one game, 68 abandoned
+calls against 187 counted, so real spend runs up to ~36% above the logged
+figure.
 
 Cost reference (measured): a cheap-model seat costs about $0.01-0.05 per game;
 frontier seats $0.2-0.8. A 3-4 seat game of popular open-weights models runs a
