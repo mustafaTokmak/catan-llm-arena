@@ -167,6 +167,10 @@ def main():
             m = pending.pop(0)
             if m.poll():
                 live.append(m)
+                # OpenRouter documents no concurrency cap, but Cloudflare in front
+                # of it blocks bursts; starting 50 processes in lockstep looks like
+                # one. A fifth of a second apart does not.
+                time.sleep(0.2)
         live = [m for m in live if m.poll()]
         if time.time() - last > 15:
             last = time.time()
