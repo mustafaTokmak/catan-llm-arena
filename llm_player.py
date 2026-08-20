@@ -1,15 +1,19 @@
 """OpenRouter-backed Catan player: any model on openrouter.ai can take a seat.
 
 Each decide() is one stateless chat-completions call: compact game summary +
-numbered list of legal actions in, JSON {"reason", "action_index"} out. Any
-failure (missing OPENROUTER_API_KEY, API error, refusal, unparseable reply,
-bad index) falls back to a random legal action so a game never crashes
-mid-arena; fallbacks are counted so contaminated runs are visible.
+numbered list of legal actions in, JSON {"reason", "action_index"} out.
+
+Every move is the model's own. A slow or failing call is retried until the
+model answers -- never substituted with a random move, because a substituted
+move measures the arena, not the model. Retries use an escalating deadline
+(a hung connection is abandoned quickly; a genuinely slow provider is given
+more room each attempt). Only unrecoverable setup errors (bad key, unknown
+model, no credit) stop a match, loudly.
 """
 
+import itertools
 import json
 import os
-import random
 import re
 import sys
 import time
@@ -99,17 +103,33 @@ def _api_key():
     raise KeyError("OPENROUTER_API_KEY not set (env var or .env file)")
 
 
+FATAL_STATUS = {401, 402, 403}  # bad key, no credit, blocked: retrying can't help
+
+
+class FatalSetupError(Exception):
+    """Wrong key, unknown model, or empty account — stop rather than spin."""
+
+
 class LLMPlayer(Player):
-    def __init__(self, color, model="deepseek/deepseek-v4-flash", timeout=90.0, deadline=75.0):
+    def __init__(
+        self,
+        color,
+        model="deepseek/deepseek-v4-flash",
+        timeout=180.0,
+        deadline=20.0,
+        max_deadline=120.0,
+    ):
         super().__init__(color)
         self.model = model
         self.timeout = timeout
-        self.deadline = deadline  # hard wall-clock cap per call: keepalive
-        # trickle from some providers defeats httpx's read timeout entirely
+        # First attempt gives up at `deadline` — a hung socket shouldn't cost a
+        # minute. Each retry allows longer, so a merely slow provider still lands.
+        self.deadline = deadline
+        self.max_deadline = max_deadline
         self.use_schema = supports_schema(model)
-        self._http = None  # lazy: lets keyless runs degrade to random moves
+        self._http = None
         self.api_calls = 0
-        self.fallbacks = 0
+        self.retries = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.cost_usd = 0.0
@@ -120,30 +140,46 @@ class LLMPlayer(Player):
         actions = list(playable_actions)
         if len(actions) == 1:  # forced move (roll, end turn): skip the API
             return actions[0]
-        try:
-            action = actions[self._ask(game, actions)]
+        for attempt in itertools.count():  # every move is the model's own
+            deadline = min(self.deadline * 1.6**attempt, self.max_deadline)
+            try:
+                action = actions[self._ask(game, actions, deadline)]
+            except FatalSetupError:
+                raise
+            except Exception as exc:
+                self.retries += 1
+                self.last_error = repr(exc)[:200]
+                wait = self._retry_wait(exc, attempt)
+                self._log(
+                    f"RETRY (attempt {attempt + 1} gave up at {deadline:.0f}s, "
+                    f"waiting {wait:.0f}s) {self.last_error[:70]}"
+                )
+                time.sleep(wait)
+                continue
             value = "" if action.value is None else f" {action.value}"
-            print(  # live progress: tail -f the log to watch the game
-                f"{time.strftime('%H:%M:%S')} [{self.model}] {action.action_type.value}{value} "
-                f"(${self.cost_usd:.4f} total) {self.last_reason[:70]}",
-                file=sys.stderr,
-                flush=True,
+            self._log(
+                f"{action.action_type.value}{value} "
+                f"(${self.cost_usd:.4f} total) {self.last_reason[:70]}"
             )
             return action
-        except Exception as exc:
-            self.fallbacks += 1
-            self.last_error = repr(exc)[:200]
-            print(
-                f"{time.strftime('%H:%M:%S')} [{self.model}] FALLBACK random ({self.last_error[:80]})",
-                file=sys.stderr,
-                flush=True,
-            )
-            return random.choice(actions)
 
-    def _ask(self, game, actions):
+    def _log(self, text):  # live progress: tail -f the match log
+        print(f"{time.strftime('%H:%M:%S')} [{self.model}] {text}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _retry_wait(exc, attempt):
+        response = getattr(exc, "response", None)
+        if response is not None and response.status_code == 429:
+            return min(float(response.headers.get("retry-after") or 5 * (attempt + 1)), 30)
+        return min(2 * (attempt + 1), 15)
+
+    def _ask(self, game, actions, deadline):
         prompt = self.build_prompt(game, actions)
         if self._http is None:
-            key = _api_key()  # raises -> random fallback
+            try:
+                key = _api_key()
+            except KeyError as exc:
+                raise FatalSetupError(str(exc)) from None
             self._http = httpx.Client(
                 headers={"Authorization": f"Bearer {key}"}, timeout=self.timeout
             )
@@ -160,19 +196,15 @@ class LLMPlayer(Player):
         if self.use_schema:
             payload["response_format"] = RESPONSE_FORMAT
             payload["provider"] = {"require_parameters": True}
-        for attempt in range(4):  # real backoff: 429s want patience, not dice
-            response = self._post_with_deadline(payload)
-            if response.status_code in (400, 404) and self.use_schema:
-                self.use_schema = False  # provider dropped support mid-match
-                payload.pop("response_format")
-                payload.pop("provider")
-                continue
-            if response.status_code != 429 and response.status_code < 500:
-                break
-            if attempt < 3:
-                wait = float(response.headers.get("retry-after") or 2 * (attempt + 1))
-                time.sleep(min(wait, 15))
-        response.raise_for_status()
+        response = self._post_with_deadline(payload, deadline)
+        if response.status_code in (400, 404) and self.use_schema:
+            self.use_schema = False  # this endpoint won't enforce the schema
+            payload.pop("response_format")
+            payload.pop("provider")
+            response = self._post_with_deadline(payload, deadline)
+        if response.status_code in FATAL_STATUS or response.status_code == 404:
+            raise FatalSetupError(f"HTTP {response.status_code}: {response.text[:200]}")
+        response.raise_for_status()  # 429/5xx: the caller retries
         data = response.json()
         self.api_calls += 1
         usage = data.get("usage") or {}
@@ -200,14 +232,14 @@ class LLMPlayer(Player):
             raise ValueError(f"action_index {index} out of range")
         return index
 
-    def _post_with_deadline(self, payload):
+    def _post_with_deadline(self, payload, deadline):
         pool = ThreadPoolExecutor(max_workers=1)
         try:
             return pool.submit(self._http.post, API_URL, json=payload).result(
-                timeout=self.deadline
+                timeout=deadline
             )
         except FutureTimeout:
-            raise TimeoutError(f"no response within {self.deadline}s") from None
+            raise TimeoutError(f"no response within {deadline:.0f}s") from None
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
@@ -247,23 +279,29 @@ class LLMPlayer(Player):
         return "\n".join(lines)
 
 
-if __name__ == "__main__":  # smoke test: one real LLM decision (<0.01 cent)
+if __name__ == "__main__":  # smoke test: one real decision, plus the retry path
     from catanatron import Color, Game, RandomPlayer
 
     llm = LLMPlayer(Color.RED)
     others = [RandomPlayer(c) for c in (Color.BLUE, Color.WHITE, Color.ORANGE)]
     game = Game([llm, *others])
+    real_post, failures = llm._post_with_deadline, itertools.count()
+
+    def flaky(payload, deadline):  # first two calls fail: the move must survive
+        if next(failures) < 2:
+            raise TimeoutError("simulated stall")
+        return real_post(payload, deadline)
+
+    llm._post_with_deadline = flaky
     for _ in range(40):  # tick until the LLM faces one multi-option decision
-        if llm.api_calls or llm.fallbacks:
+        if llm.api_calls:
             break
         game.play_tick()
-    assert llm.api_calls == 1 and llm.fallbacks == 0, (
-        llm.api_calls,
-        llm.fallbacks,
-        llm.last_error,
-    )
+    assert llm.api_calls == 1, (llm.api_calls, llm.last_error)
+    assert llm.retries >= 2, f"expected the 2 stalls to be retried, got {llm.retries}"
+    assert llm.last_reason, "model returned no reasoning"
     print(
-        f"OK model={llm.model} schema={llm.use_schema} "
+        f"OK model={llm.model} schema={llm.use_schema} retries={llm.retries} "
         f"tokens={llm.input_tokens}/{llm.output_tokens} "
         f"cost=${llm.cost_usd:.5f} reason={llm.last_reason!r}"
     )

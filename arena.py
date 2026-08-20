@@ -116,7 +116,13 @@ def main():
             results = [json.loads(line) for line in f]
 
     for i in range(len(results), args.games):
-        game = run_game(players, specs, f"{args.log}_g{i}", args.resume)
+        try:
+            game = run_game(players, specs, f"{args.log}_g{i}", args.resume)
+        except Exception as exc:
+            if type(exc).__name__ != "FatalSetupError":
+                raise
+            print(f"fatal: {exc}", file=sys.stderr)
+            raise SystemExit(3)  # supervisor stops instead of looping
         winner = game.winning_color()
         record = {
             "game": i,
@@ -137,7 +143,7 @@ def main():
         if hasattr(player, "api_calls"):
             print(
                 f"[{labels[player.color]}] this session: api_calls={player.api_calls} "
-                f"fallbacks={player.fallbacks} "
+                f"retries={player.retries} "
                 f"tokens={player.input_tokens}/{player.output_tokens} "
                 f"cost=${player.cost_usd:.4f}"
             )

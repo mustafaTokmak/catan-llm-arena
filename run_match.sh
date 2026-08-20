@@ -6,7 +6,12 @@
 NAME="${1:-match1}"
 PLAYERS="${2:-llm:z-ai/glm-5.2,llm:deepseek/deepseek-v4-flash,llm:qwen/qwen3.7-flash}"
 echo "match $NAME: logging moves to $NAME.out, state to ${NAME}_g*.jsonl/.pkl"
-until .venv/bin/python arena.py --games 1 --players "$PLAYERS" --log "$NAME" --resume >> "$NAME.out" 2>&1; do
+while true; do
+  .venv/bin/python arena.py --games 1 --players "$PLAYERS" --log "$NAME" --resume >> "$NAME.out" 2>&1 && break
+  if [ $? -eq 3 ]; then
+    echo "[supervisor] fatal setup error, not resuming" | tee -a "$NAME.out"
+    exit 3
+  fi
   echo "[supervisor] arena died, resuming in 3s" >> "$NAME.out"
   sleep 3
 done
