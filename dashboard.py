@@ -463,10 +463,13 @@ def seat_html(rows, spent=None):
             f"title='{res.lower()}'>{r['hand'][res]}</span>"
             for res in RESOURCES
         )
-        cards = "".join(
+        cards = "".join(  # "knight 2 · 1 played" beats "knight 2 +1"
             f"<span class='dv{'' if r['held'][c] else ' spent'}'>{DEV_LABEL[c]}"
-            f"<b>{r['held'][c]}</b>"
-            + (f"<i>+{r['played'][c]}</i>" if r["played"][c] else "")
+            + (
+                f"<b>{r['held'][c]}</b>" + (f"<i>&middot; {r['played'][c]} played</i>" if r["played"][c] else "")
+                if r["held"][c]
+                else f"<b>{r['played'][c]}</b><i>played</i>"
+            )
             + "</span>"
             for c in DEV_CARDS
             if r["held"][c] or r["played"][c]
@@ -624,7 +627,9 @@ font:500 10px "IBM Plex Mono",monospace;letter-spacing:.2em;text-transform:upper
 .entry{position:relative;margin:0 0 15px;--seat:#888}
 .entry:before{content:"";position:absolute;left:-21px;top:6px;width:8px;height:8px;
 border-radius:50%;background:var(--seat);box-shadow:0 0 0 3px var(--ink)}
-.entry.key:before{box-shadow:0 0 0 3px var(--ink),0 0 0 5px rgba(232,201,106,.45)}
+/* a scored point gets a diamond: the shape says "victory point", the fill says who */
+.entry.key:before{width:9px;height:9px;left:-21.5px;border-radius:1px;
+transform:rotate(45deg);outline:1.5px solid var(--gold);outline-offset:1.5px}
 .act{font-weight:600;font-size:14.5px;letter-spacing:-.005em}
 .entry.key .act{color:var(--gold)}
 .entry.waiting .act{color:var(--warn)}
