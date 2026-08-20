@@ -80,7 +80,7 @@ class LLMPlayer(Player):
             action = actions[self._ask(game, actions)]
             value = "" if action.value is None else f" {action.value}"
             print(  # live progress: tail -f the log to watch the game
-                f"[{self.model}] {action.action_type.value}{value} "
+                f"{time.strftime('%H:%M:%S')} [{self.model}] {action.action_type.value}{value} "
                 f"(${self.cost_usd:.4f} total) {self.last_reason[:70]}",
                 file=sys.stderr,
                 flush=True,
@@ -90,7 +90,7 @@ class LLMPlayer(Player):
             self.fallbacks += 1
             self.last_error = repr(exc)[:200]
             print(
-                f"[{self.model}] FALLBACK random ({self.last_error[:80]})",
+                f"{time.strftime('%H:%M:%S')} [{self.model}] FALLBACK random ({self.last_error[:80]})",
                 file=sys.stderr,
                 flush=True,
             )
