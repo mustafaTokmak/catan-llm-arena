@@ -72,43 +72,78 @@ def load(base, upto=None):
     return game, blob["specs"], len(actions)
 
 
-def vp_history(base, samples=90):
-    """Victory points per seat over the game, sampled for the progress chart."""
+def vp_history(base, upto=None, samples=140):
+    """Victory points per seat over time, up to the move being viewed."""
     with open(base + ".pkl", "rb") as f:
         blob = pickle.load(f)
     actions = blob["actions"]
+    if upto is not None:
+        actions = actions[:upto]  # scrubbing must not spoil the ending
     game = Game([RandomPlayer(c) for c in COLORS[: len(blob["specs"])]], seed=blob["seed"])
     step = max(1, len(actions) // samples)
-    series = {c.value: [] for c in game.state.colors}
-    marks = []
+    turns, series = [0], {c.value: [0] for c in game.state.colors}
     for i, action in enumerate(actions):
         game.execute(action, validate_action=False)
         if i % step == 0 or i == len(actions) - 1:
-            marks.append(i + 1)
+            turns.append(game.state.num_turns)
             for color in game.state.colors:
                 series[color.value].append(get_actual_victory_points(game.state, color))
-    return marks, series
+    return turns, series
 
 
-def vp_chart(marks, series, width=560, height=150):
-    if len(marks) < 2:
-        return "<div class=muted>not enough moves yet</div>"
+def vp_chart(turns, series, labels, width=560, height=196):
+    """Step chart with a win line, a turn axis, and a named legend."""
+    if len(turns) < 3:
+        return "<div class=muted>chart appears after a few moves</div>"
     top = max(10, max(max(v) for v in series.values()))
-    sx = lambda i: 34 + (width - 44) * marks[i] / marks[-1]
-    sy = lambda v: height - 24 - (height - 40) * v / top
-    out = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img"><title>victory points</title>']
+    left, right, head, foot = 30, width - 40, 14, height - 44
+    sx = lambda t: left + (right - left) * t / max(turns[-1], 1)
+    sy = lambda v: foot - (foot - head) * v / top
+    out = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" role="img">'
+        "<title>victory points over time</title>"
+    ]
     for vp in range(0, top + 1, 2):
-        y = sy(vp)
-        out.append(f'<line x1="34" y1="{y:.1f}" x2="{width - 10}" y2="{y:.1f}" stroke="#2e2e26"/>')
-        out.append(f'<text x="26" y="{y:.1f}" text-anchor="end" dominant-baseline="central" font-size="10" fill="#9a978c">{vp}</text>')
-    for color, values in series.items():
-        points = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in enumerate(values))
+        y, win = sy(vp), vp == 10
+        out.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" '
+            f'stroke="{"#6b6a52" if win else "#2a2a22"}"'
+            + (' stroke-dasharray="5 4"' if win else "")
+            + "/>"
+        )
+        out.append(
+            f'<text x="{left - 7}" y="{y:.1f}" text-anchor="end" dominant-baseline="central" '
+            f'font-size="10" fill="{"#c9c079" if win else "#8a877c"}">{vp}</text>'
+        )
+    for t in (0, turns[-1]):
+        out.append(
+            f'<text x="{sx(t):.1f}" y="{foot + 15:.1f}" text-anchor="middle" '
+            f'font-size="10" fill="#8a877c">turn {t}</text>'
+        )
+    legend = []
+    for slot, (color, values) in enumerate(series.items()):
+        # nudge each line a hair apart so tied scores stay readable
+        offset = (slot - (len(series) - 1) / 2) * 1.6
+        points = " ".join(
+            f"{sx(t):.1f},{sy(v) + offset:.1f}" for t, v in zip(turns, values)
+        )
         out.append(
             f'<polyline points="{points}" fill="none" stroke="{SEAT_FILL[color]}" '
-            'stroke-width="2.5" stroke-linejoin="round"/>'
+            'stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        ex, ey = sx(turns[-1]), sy(values[-1]) + offset
+        out.append(f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="3.4" fill="{SEAT_FILL[color]}"/>')
+        out.append(
+            f'<text x="{ex + 7:.1f}" y="{ey:.1f}" dominant-baseline="central" font-size="11" '
+            f'font-weight="500" fill="{SEAT_FILL[color]}">{values[-1]}</text>'
+        )
+        name = short(labels.get(color, "?"))
+        legend.append(
+            f"<span class=lg><span class=dot style='background:{SEAT_FILL[color]}'></span>"
+            f"{name} <b>{values[-1]}</b></span>"
         )
     out.append("</svg>")
-    return "".join(out)
+    return "".join(out) + f"<div class=legend>{''.join(legend)}</div>"
 
 
 def decisions(match_name, game_index):
@@ -125,6 +160,36 @@ def decisions(match_name, game_index):
             if row.get("game") == game_index:
                 rows.append(row)
     return rows
+
+
+def short(spec):
+    """`llm:openai/gpt-5.6-luna` -> `gpt-5.6-luna`: seats are named by model, not colour."""
+    return html.escape(str(spec).removeprefix("llm:").split("/")[-1])
+
+
+def spend(rows, upto_turn=None):
+    """Per-seat spend so far: {color: {cost, moves, retries, tokens}}.
+
+    New logs carry a per-move `cost_usd` delta plus a cumulative `cost_total`;
+    older logs put the running total in `cost_usd`, hence the two branches.
+    """
+    out = {}
+    for row in rows:
+        if upto_turn is not None and (row.get("turn") or 0) > upto_turn:
+            break
+        s = out.setdefault(
+            row.get("color"), {"cost": 0.0, "moves": 0, "retries": 0, "tokens": 0}
+        )
+        if row.get("type") == "retry":
+            s["retries"] += 1
+            continue
+        s["moves"] += 1
+        s["tokens"] += (row.get("tokens_in") or 0) + (row.get("tokens_out") or 0)
+        if "cost_total" in row:
+            s["cost"] += row.get("cost_usd") or 0
+        else:
+            s["cost"] = max(s["cost"], row.get("cost_usd") or 0)
+    return out
 
 
 def node_positions(board_map):
@@ -213,15 +278,17 @@ def board_svg(game, last_action=None):
                 'font-size="11" font-weight="600" fill="#1c1c1a">C</text>'
             )
     if last_action is not None:  # ring whatever just changed
-        value = last_action.value
+        kind, value = last_action.action_type.value, last_action.value
         spot = None
-        if isinstance(value, int) and value in positions:
+        # dispatch on action type, not value shape: a ROLL's (3, 6) looks
+        # exactly like a road between nodes 3 and 6
+        if kind in ("BUILD_SETTLEMENT", "BUILD_CITY") and value in positions:
             spot = at(positions[value])
-        elif isinstance(value, tuple) and len(value) == 2 and value[0] in positions:
+        elif kind == "BUILD_ROAD" and isinstance(value, tuple) and value[0] in positions:
             (x1, y1), (x2, y2) = at(positions[value[0]]), at(positions[value[1]])
             spot = ((x1 + x2) / 2, (y1 + y2) / 2)
-        elif isinstance(value, tuple) and value and isinstance(value[0], tuple):
-            spot = at(centers.get(value[0], (0, 0)))
+        elif kind == "MOVE_ROBBER" and isinstance(value, tuple) and value[0] in centers:
+            spot = at(centers[value[0]])
         if spot:
             out.append(
                 f'<circle cx="{spot[0]:.1f}" cy="{spot[1]:.1f}" r="20" fill="none" '
@@ -276,10 +343,19 @@ def seat_rows(game, specs):
     return sorted(rows, key=lambda r: -r["vp"])
 
 
-def seat_html(rows):
+def seat_html(rows, spent=None):
     """Seat cards: resources as coloured chips, dev cards held vs played."""
     out = []
+    spent = spent or {}
     for r in rows:
+        s = spent.get(r["color"])
+        money = (
+            f"<span class=spend>${s['cost']:.4f}</span> over {s['moves']} moves"
+            f" &middot; {s['tokens'] / 1000:.1f}k tokens"
+            + (f" &middot; {s['retries']} retries" if s["retries"] else "")
+            if s
+            else ""
+        )
         chips = "".join(
             f"<span class=chip style='background:{TILE_FILL[res]}'>{res[:2].lower()} "
             f"<b>{r['hand'][res]}</b></span>"
@@ -297,14 +373,14 @@ def seat_html(rows):
         out.append(
             f"<div class=seat><div class=seathead>"
             f"<span class=dot style='background:{SEAT_FILL[r['color']]}'></span>"
-            f"<b>{html.escape(r['model'])}</b><span class=vp>{r['vp']} vp</span></div>"
+            f"<b>{short(r['model'])}</b><span class=vp>{r['vp']} vp</span></div>"
             f"<div class=chips>{chips}"
             f"<span class='chip count{danger}'>{r['cards']} cards</span></div>"
             f"<div class=chips>{cards}</div>"
             f"<div class=muted>{r['towns']} settlements &middot; {r['cities']} cities &middot; "
             f"{r['roads']} roads (longest {r['road_len']})"
             + (f" &middot; <b>{html.escape(r['badges'])}</b>" if r["badges"] else "")
-            + "</div></div>"
+            + f"</div><div class=muted>{money}</div></div>"
         )
     return "".join(out)
 
@@ -326,7 +402,12 @@ body{{background:#14140f;color:#e8e6df;font:15px/1.6 -apple-system,system-ui,san
 a{{color:#e8c96a}} h1{{font-size:20px;font-weight:500;margin:0 0 4px}} h2{{font-size:16px;font-weight:500;margin:24px 0 8px}}
 .muted{{color:#9a978c;font-size:13px}} table{{border-collapse:collapse;width:100%;max-width:900px}}
 td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-size:14px}} th{{color:#9a978c;font-weight:500}}
-.wrap{{display:flex;gap:28px;flex-wrap:wrap}} .board{{flex:1 1 520px;max-width:640px}} .side{{flex:1 1 380px}}
+.page{{max-width:1500px;margin:0 auto}}
+.wrap{{display:grid;grid-template-columns:minmax(440px,1.05fr) minmax(400px,1fr);
+gap:30px;align-items:start}}
+@media (max-width:1080px){{.wrap{{grid-template-columns:1fr}}}}
+.seatgrid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px}}
+.timeline{{max-height:560px;overflow-y:auto;padding-right:6px}}
 .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px;vertical-align:middle}}
 .log{{font-size:13px;color:#c9c6bb;border-left:2px solid #2e2e26;padding-left:12px;margin:9px 0}}
 .warn{{border-left-color:#a4472c;color:#d9a08c}}
@@ -346,6 +427,11 @@ td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-siz
 padding:4px 10px;font-size:13px;cursor:pointer}}
 .scrub button:hover{{background:#2e2e26}}
 .live{{color:#7fae4a;font-size:13px}}
+.legend{{display:flex;flex-wrap:wrap;gap:14px;margin:2px 0 6px;font-size:12px;color:#c9c6bb}}
+.lg{{white-space:nowrap}} .lg b{{font-weight:500;color:#e8e6df}}
+.retry{{font-size:11px;color:#d9a08c;background:#2e211c;border:1px solid #5c3527;
+border-radius:999px;padding:1px 7px;margin-left:6px;white-space:nowrap;cursor:help}}
+.spend{{font-variant-numeric:tabular-nums;color:#7fae4a}}
 </style></head><body>{body}</body></html>"""
 
 
@@ -360,14 +446,17 @@ def index_page():
             rows.append(f"<tr><td>{html.escape(base)}</td><td colspan=4 class=muted>loading ({exc})</td></tr>")
             continue
         winner = game.winning_color()
+        seats = dict(zip(COLORS, specs))
         lead = seat_rows(game, specs)[0]
         status = (
-            f"<b>winner: {winner.value}</b>" if winner else f"leading: {html.escape(lead['model'])} ({lead['vp']} vp)"
+            f"<b>winner: {short(seats.get(winner, winner.value))}</b>"
+            if winner
+            else f"leading: {short(lead['model'])} ({lead['vp']} vp)"
         )
         rows.append(
             f"<tr><td><a href='/game?base={html.escape(base)}'>{html.escape(base)}</a></td>"
             f"<td>{game.state.num_turns}</td><td>{n}</td>"
-            f"<td class=muted>{html.escape(', '.join(specs))}</td><td>{status}</td></tr>"
+            f"<td class=muted>{', '.join(short(s) for s in specs)}</td><td>{status}</td></tr>"
         )
     board = leaderboard()
     lb = "".join(
@@ -383,11 +472,12 @@ def index_page():
         else ""
     )
     body = (
-        "<h1>Catan LLM arena</h1><div class=muted>every match on disk, replayed from its move log"
+        "<div class=page><h1>Catan LLM arena</h1>"
+        "<div class=muted>every match on disk, replayed from its move log"
         f" &middot; refreshes every 5s</div>{lb_table}<h2>matches</h2><table>"
         "<tr><th>game</th><th>turn</th><th>actions</th><th>seats</th><th>status</th></tr>"
         + ("".join(rows) or "<tr><td colspan=5 class=muted>no matches yet — run ./run_match.sh</td></tr>")
-        + "</table>"
+        + "</table></div>"
     )
     return PAGE.format(title="Catan LLM arena", body=body, refresh=REFRESH)
 
@@ -412,7 +502,9 @@ def action_times(base):
 def last_action(base, upto):
     with open(base + ".pkl", "rb") as f:
         actions = pickle.load(f)["actions"]
-    return actions[upto - 1] if 0 < upto <= len(actions) else (actions[-1] if actions else None)
+    if upto <= 0 or not actions:  # rewound to the empty board: nothing to ring
+        return None
+    return actions[min(upto, len(actions)) - 1]
 
 
 def leaderboard():
@@ -444,7 +536,10 @@ def leaderboard():
                     continue
                 s["moves"] += 1
                 s["seconds"].append(row.get("seconds", 0))
-                s["cost"] = max(s["cost"], row.get("cost_usd", 0))
+                if "cost_total" in row:  # per-move delta; older logs logged the running total
+                    s["cost"] += row.get("cost_usd") or 0
+                else:
+                    s["cost"] = max(s["cost"], row.get("cost_usd") or 0)
                 games[(row.get("model"), path, row.get("game"))] = 1
     rows = []
     for model, s in stats.items():
@@ -463,23 +558,82 @@ def leaderboard():
     return sorted(rows, key=lambda r: (-r["wins"], r["median_s"]))
 
 
+RESOURCE_RE = re.compile(r"'([A-Z_]+)'")
+
+
+def pretty_action(text):
+    """Turn `MARITIME_TRADE ('ORE','ORE','ORE',None,'WHEAT')` into `trade 3x ore -> wheat`."""
+    kind, _, rest = str(text).partition(" ")
+    rest = rest.strip()
+    if kind == "MARITIME_TRADE":
+        items = RESOURCE_RE.findall(rest)
+        if items:
+            *give, get = items
+            counts = Counter(give)
+            traded = ", ".join(f"{n}&times; {r.lower()}" for r, n in counts.items())
+            return f"trade {traded} &rarr; {get.lower()}"
+    if kind == "MOVE_ROBBER":
+        victim = re.search(r"Color\.([A-Z]+)", rest)
+        return "move robber" + (f" &rarr; rob {victim.group(1).lower()}" if victim else "")
+    if kind == "BUILD_ROAD":
+        nodes = re.findall(r"\d+", rest)
+        return f"build road {'&ndash;'.join(nodes[:2])}" if nodes else "build road"
+    if kind == "BUILD_SETTLEMENT":
+        return f"build settlement {rest}"
+    if kind == "BUILD_CITY":
+        return f"upgrade to city {rest}"
+    if kind == "PLAY_YEAR_OF_PLENTY":
+        return "year of plenty: " + ", ".join(r.lower() for r in RESOURCE_RE.findall(rest))
+    if kind == "PLAY_MONOPOLY":
+        got = RESOURCE_RE.findall(rest)
+        return "monopoly: " + (got[0].lower() if got else rest.lower())
+    simple = {
+        "BUY_DEVELOPMENT_CARD": "buy development card",
+        "PLAY_KNIGHT_CARD": "play knight",
+        "PLAY_ROAD_BUILDING": "play road building",
+        "END_TURN": "end turn",
+        "ROLL": "roll",
+        "DISCARD": "discard",
+    }
+    return simple.get(kind, html.escape(str(text)).lower())
+
+
+def merge_retries(rows):
+    """A retry is part of the decision it delayed, not an event of its own."""
+    pending, merged = {}, []
+    for row in rows:
+        model = row.get("model")
+        if row.get("type") == "retry":
+            pending.setdefault(model, []).append(row)
+            continue
+        merged.append({**row, "waits": pending.pop(model, [])})
+    for model, waits in pending.items():  # still retrying: no move yet
+        merged.append({**waits[-1], "type": "waiting", "waits": waits})
+    return merged
+
+
 def entry_html(d):
-    """Render one timeline row: a move the model chose, or a retry it survived."""
+    """One timeline row: the move a model made, with any retries folded in."""
     dot = f"<span class=dot style='background:{SEAT_FILL.get(d.get('color'), '#888')}'></span>"
-    model = html.escape(str(d.get("model", "?")).split("/")[-1])
-    turn = d.get("turn", "?")
-    if d.get("type") == "retry":
+    model = short(d.get("model", "?"))
+    waits = d.get("waits") or []
+    badge = ""
+    if waits:
+        gave_up = ", ".join(f"{w.get('gave_up_after_s', '?')}s" for w in waits)
+        badge = (
+            f"<span class=retry title='{html.escape(str(waits[-1].get('error', ''))[:150])}'>"
+            f"&#8635; {len(waits)} retr{'y' if len(waits) == 1 else 'ies'} ({gave_up})</span>"
+        )
+    if d.get("type") == "waiting":
         return (
-            f"<div class='log warn'>{dot}<b>retry {d.get('attempt', '?')}</b> "
-            f"<span class=muted>turn {turn} &middot; gave up after "
-            f"{d.get('gave_up_after_s', '?')}s &middot; {model}</span><br>"
-            f"{html.escape(str(d.get('error', ''))[:120])}</div>"
+            f"<div class='log warn'>{dot}<b>waiting for {model}</b> {badge}<br>"
+            f"<span class=muted>turn {d.get('turn', '?')} &middot; still retrying</span></div>"
         )
     return (
-        f"<div class=log>{dot}<b>{html.escape(str(d.get('action', '?')))}</b> "
-        f"<span class=muted>turn {turn} &middot; {d.get('seconds', '?')}s &middot; "
-        f"chose {d.get('chose', '?')}/{d.get('options', '?')} &middot; "
-        f"${d.get('cost_usd', 0):.4f} &middot; {model}</span><br>"
+        f"<div class=log>{dot}<b>{pretty_action(d.get('action', '?'))}</b> {badge}"
+        f"<div class=muted>turn {d.get('turn', '?')} &middot; {model} &middot; "
+        f"{d.get('seconds', '?')}s &middot; picked {d.get('chose', '?')} of "
+        f"{d.get('options', '?')} options</div>"
         f"{html.escape(str(d.get('reason', '')))}</div>"
     )
 
@@ -489,7 +643,8 @@ def game_page(base, at=None):
     live = at is None or at >= n
     match_name, game_index = base.rsplit("_g", 1)[0], int(base.rsplit("_g", 1)[1])
     winner = game.winning_color()
-    rows = seat_html(seat_rows(game, specs))
+    rowsd = decisions(match_name, game_index)
+    rows = seat_html(seat_rows(game, specs), spend(rowsd, game.state.num_turns))
 
     shown = n if live else at
     prev_at, next_at = max(0, shown - 1), min(n, shown + 1)
@@ -509,8 +664,9 @@ def game_page(base, at=None):
         f"<script>const BASE={base!r};let cur={shown},N={n},timer=null,liveTimer=null;"
         "async function goto(i){const r=await fetch('/frame?base='+BASE+'&at='+Math.max(0,i));"
         "const d=await r.json();cur=d.at;N=d.n;sc.max=N;sc.value=cur;lab.textContent=cur;"
-        "tot.textContent=N;board.innerHTML=d.svg;seats.innerHTML=d.seats;meta.textContent=d.meta;"
-        "return d;}"
+        "tot.textContent=N;board.innerHTML=d.svg;seats.innerHTML=d.seats;"
+        "chart.innerHTML=d.chart;meta.textContent=d.meta;"
+        "if(d.timeline)tl.innerHTML=d.timeline;return d;}"
         "function halt(){clearTimeout(timer);clearInterval(timer);timer=null;"
         "clearInterval(liveTimer);liveTimer=null;}"
         "async function step(ms){if(cur>=N){halt();follow();return;}const d=await goto(cur+1);"
@@ -528,21 +684,29 @@ def game_page(base, at=None):
         f"{'follow();' if live else ''}</script>"
     )
 
-    rowsd = decisions(match_name, game_index)
     timeline = "".join(
-        entry_html(d) for d in rowsd[-25:][::-1]
+        entry_html(d) for d in merge_retries(rowsd)[-25:][::-1]
     ) or "".join(f"<div class=log>{html.escape(line)}</div>" for line in commentary(match_name))
 
-    marks, series = vp_history(base)
-    banner = f"<h2>winner: {winner.value}</h2>" if winner else ""
+    labels = {c.value: spec for c, spec in zip(COLORS, specs)}
+    turns, series = vp_history(base, upto=shown)
+    banner = (
+        f"<h2>winner: {short(dict(zip(COLORS, specs)).get(winner, winner.value))}</h2>"
+        if winner
+        else ""
+    )
     body = (
+        "<div class=page>"
         f"<h1><a href='/'>arena</a> / {html.escape(base)}</h1>"
         f"<div class=muted id=meta>turn {game.state.num_turns} &middot; {n} actions recorded</div>{banner}"
         f"{scrubber}"
-        f"<div class=wrap><div class=board id=board>{board_svg(game, last_action(base, shown))}</div>"
-        f"<div class=side><h2>seats</h2><div id=seats>{rows}</div>"
-        f"<h2>victory points over the game</h2>{vp_chart(marks, series)}"
-        f"<h2>decisions</h2>{timeline or '<div class=muted>no decisions logged yet</div>'}</div></div>"
+        "<div class=wrap>"
+        f"<div><div id=board>{board_svg(game, last_action(base, shown))}</div>"
+        f"<h2>victory points</h2><div id=chart>{vp_chart(turns, series, labels)}</div></div>"
+        f"<div><h2>seats</h2><div id=seats class=seatgrid>{rows}</div>"
+        "<h2>decisions</h2>"
+        f"<div class=timeline id=tl>{timeline or '<div class=muted>no decisions logged yet</div>'}</div>"
+        "</div></div></div>"
     )
     return PAGE.format(title=base, body=body, refresh="")  # JS follows live, no reload
 
@@ -550,21 +714,34 @@ def game_page(base, at=None):
 def frame(base, at):
     """One playback frame: board + seats, and how long the real move took."""
     game, specs, n = load(base, upto=at)
+    match_name, game_index = base.rsplit("_g", 1)[0], int(base.rsplit("_g", 1)[1])
     times = action_times(base)
     gap = None
     if 0 < at < len(times) and times[at] and times[at - 1]:
         gap = (times[at] - times[at - 1]) * 1000
-    rows = seat_html(seat_rows(game, specs))
+    rowsd = decisions(match_name, game_index)
+    spent = spend(rowsd, game.state.num_turns)
+    rows = seat_html(seat_rows(game, specs), spent)
     action = last_action(base, at)
     at = min(at, n)
+    labels = {c.value: spec for c, spec in zip(COLORS, specs)}
+    turns, series = vp_history(base, upto=at)
+    total = sum(s["cost"] for s in spent.values())
+    shown = [d for d in merge_retries(rowsd) if (d.get("turn") or 0) <= game.state.num_turns]
     return {
         "svg": board_svg(game, action),
         "seats": rows,
+        "chart": vp_chart(turns, series, labels),
+        "timeline": "".join(entry_html(d) for d in shown[-25:][::-1]),
         "gap_ms": gap,
         "at": at,
         "n": n,
-        "meta": f"turn {game.state.num_turns} · move {at} / {n}"
-        + (f" · {action.color.value} {action.action_type.value}" if action else ""),
+        "meta": f"turn {game.state.num_turns} · move {at} / {n} · ${total:.4f} spent"
+        + (
+            f" · {short(labels.get(action.color.value, '?'))} {action.action_type.value.lower()}"
+            if action
+            else ""
+        ),
     }
 
 

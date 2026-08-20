@@ -35,9 +35,14 @@ def load_game(base):
     return game, blob["specs"], len(blob["actions"])
 
 
+def short(spec):
+    """Seats read as model names, not colours."""
+    return str(spec).removeprefix("llm:").split("/")[-1]
+
+
 def render(game, specs, n_actions, base):
     state = game.state
-    seats = dict(zip(COLORS, specs))
+    seats = {c: short(s) for c, s in zip(COLORS, specs)}
     lines = [f"=== {base} | turn {state.num_turns} | {n_actions} actions ==="]
 
     board = state.board
@@ -66,7 +71,7 @@ def render(game, specs, n_actions, base):
         if get_largest_army(state)[0] == color:
             badges.append("LARGEST ARMY")
         lines.append(
-            f"{color.value:<7} {seats.get(color, '?'):<38} "
+            f"{seats.get(color, '?'):<22} {color.value.lower():<7} "
             f"VP:{get_actual_victory_points(state, color):>2}  {hand}  "
             f"dev:{player_num_dev_cards(state, color)}  "
             f"towns:{sorted(settlements)} cities:{sorted(cities)} roads:{len(roads)}"
@@ -77,11 +82,11 @@ def render(game, specs, n_actions, base):
     lines.append("last moves:")
     for a in recent:
         value = "" if a.value is None else f" {a.value}"
-        lines.append(f"  {a.color.value}: {a.action_type.value}{value}")
+        lines.append(f"  {seats.get(a.color, a.color.value)}: {a.action_type.value}{value}")
 
     winner = game.winning_color()
     if winner is not None:
-        lines.append(f"*** WINNER: {winner.value} ({seats.get(winner)}) ***")
+        lines.append(f"*** WINNER: {seats.get(winner, winner.value)} ({winner.value.lower()}) ***")
     return "\n".join(lines), winner
 
 

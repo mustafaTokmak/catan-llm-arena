@@ -58,7 +58,10 @@ def model_stats(decisions_path):
             moves[model] += 1
             seconds[model].append(row.get("seconds", 0))
             tokens[model] += (row.get("tokens_in") or 0) + (row.get("tokens_out") or 0)
-            cost[model] = row.get("cost_usd", cost.get(model, 0))
+            # cost_total is cumulative per seat; older logs put that in cost_usd
+            cost[model] = max(
+                cost.get(model, 0), row.get("cost_total") or row.get("cost_usd") or 0
+            )
     return [
         {
             "model": model,
@@ -137,11 +140,12 @@ def run_game(players, specs, base, resume, decisions_path=None, game_index=0):
                 )
                 seen += 1
             audit.flush()
-            with open(pkl, "wb") as f:
-                pickle.dump(
-                    {"seed": seed, "specs": specs, "actions": game.state.actions},
-                    f,
-                )
+            # atomic: a kill -9 mid-write would otherwise leave an unloadable snapshot
+            with open(pkl + ".tmp", "wb") as f:
+                pickle.dump({"seed": seed, "specs": specs, "actions": game.state.actions}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(pkl + ".tmp", pkl)
     return game
 
 
@@ -169,8 +173,12 @@ def main():
 
     results = []
     if args.resume and os.path.exists(results_path):
-        with open(results_path) as f:
-            results = [json.loads(line) for line in f]
+        with open(results_path, errors="replace") as f:
+            for line in f:
+                try:
+                    results.append(json.loads(line))
+                except ValueError:  # torn last line from a kill mid-append
+                    log.warning("skipping unreadable results line in %s", results_path)
 
     for i in range(len(results), args.games):
         try:

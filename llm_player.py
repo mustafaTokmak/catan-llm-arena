@@ -145,7 +145,8 @@ class LLMPlayer(Player):
         actions = list(playable_actions)
         if len(actions) == 1:  # forced move (roll, end turn): skip the API
             return actions[0]
-        started, before = time.time(), (self.input_tokens, self.output_tokens)
+        started = time.time()
+        before = (self.input_tokens, self.output_tokens, self.cost_usd)
         for attempt in itertools.count():  # every move is the model's own
             deadline = min(self.deadline * 1.6**attempt, self.max_deadline)
             try:
@@ -200,7 +201,8 @@ class LLMPlayer(Player):
                     "schema": self.use_schema,
                     "tokens_in": self.input_tokens - before[0],
                     "tokens_out": self.output_tokens - before[1],
-                    "cost_usd": round(self.cost_usd, 5),
+                    "cost_usd": round(self.cost_usd - before[2], 6),  # this move
+                    "cost_total": round(self.cost_usd, 5),  # this seat so far
                 }
             )
             return action
