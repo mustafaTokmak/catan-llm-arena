@@ -135,11 +135,14 @@ class LLMPlayer(Player):
         self.cost_usd = 0.0
         self.last_reason = ""
         self.last_error = ""
+        self.decisions_path = None  # set by arena.py: timeline log for the UI
+        self.game_index = 0
 
     def decide(self, game, playable_actions):
         actions = list(playable_actions)
         if len(actions) == 1:  # forced move (roll, end turn): skip the API
             return actions[0]
+        started = time.time()
         for attempt in itertools.count():  # every move is the model's own
             deadline = min(self.deadline * 1.6**attempt, self.max_deadline)
             try:
@@ -161,7 +164,31 @@ class LLMPlayer(Player):
                 f"{action.action_type.value}{value} "
                 f"(${self.cost_usd:.4f} total) {self.last_reason[:70]}"
             )
+            self._record(game, action, value, time.time() - started)
             return action
+
+    def _record(self, game, action, value, seconds):
+        """One line per decision: what the model did, why, and what it cost."""
+        if not self.decisions_path:
+            return
+        with open(self.decisions_path, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "t": time.time(),
+                        "game": self.game_index,
+                        "turn": game.state.num_turns,
+                        "color": self.color.value,
+                        "model": self.model,
+                        "action": f"{action.action_type.value}{value}",
+                        "reason": self.last_reason,
+                        "seconds": round(seconds, 1),
+                        "retries": self.retries,
+                        "cost_usd": round(self.cost_usd, 5),
+                    }
+                )
+                + "\n"
+            )
 
     def _log(self, text):  # live progress: tail -f the match log
         print(f"{time.strftime('%H:%M:%S')} [{self.model}] {text}", file=sys.stderr, flush=True)

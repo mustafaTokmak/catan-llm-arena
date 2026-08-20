@@ -20,6 +20,7 @@ import os
 import pickle
 import random
 import sys
+import time
 from collections import Counter
 
 from catanatron import Color, Game, RandomPlayer
@@ -45,9 +46,13 @@ def make_player(spec, color):
     raise SystemExit(f"unknown player spec: {spec!r}")
 
 
-def run_game(players, specs, base, resume):
+def run_game(players, specs, base, resume, decisions_path=None, game_index=0):
     """Play one game to completion, persisting every action; resumable."""
     pkl, jsonl = base + ".pkl", base + ".jsonl"
+    for player in players:
+        if hasattr(player, "decisions_path"):
+            player.decisions_path = decisions_path
+            player.game_index = game_index
     if resume and os.path.exists(pkl):
         with open(pkl, "rb") as f:
             blob = pickle.load(f)
@@ -80,6 +85,7 @@ def run_game(players, specs, base, resume):
                     json.dumps(
                         {
                             "i": seen,
+                            "t": time.time(),
                             "color": a.color.value,
                             "type": a.action_type.value,
                             "value": repr(a.value),
@@ -117,7 +123,14 @@ def main():
 
     for i in range(len(results), args.games):
         try:
-            game = run_game(players, specs, f"{args.log}_g{i}", args.resume)
+            game = run_game(
+                players,
+                specs,
+                f"{args.log}_g{i}",
+                args.resume,
+                decisions_path=args.log + "_decisions.jsonl",
+                game_index=i,
+            )
         except Exception as exc:
             if type(exc).__name__ != "FatalSetupError":
                 raise

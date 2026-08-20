@@ -10,10 +10,12 @@ themselves every 5 seconds. Stdlib only.
 
 import glob
 import html
+import json
 import math
 import os
 import pickle
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -48,13 +50,70 @@ TILE_FILL = {
 SEAT_FILL = {"RED": "#d64545", "BLUE": "#3b6fd4", "WHITE": "#e8e6df", "ORANGE": "#e08a2e"}
 
 
-def load(base):
+def load(base, upto=None):
+    """Replay the recorded actions — all of them, or the first `upto` (scrubbing)."""
     with open(base + ".pkl", "rb") as f:
         blob = pickle.load(f)
+    actions = blob["actions"]
     game = Game([RandomPlayer(c) for c in COLORS[: len(blob["specs"])]], seed=blob["seed"])
-    for action in blob["actions"]:
+    for action in actions[:upto] if upto is not None else actions:
         game.execute(action, validate_action=False)
-    return game, blob["specs"], len(blob["actions"])
+    return game, blob["specs"], len(actions)
+
+
+def vp_history(base, samples=90):
+    """Victory points per seat over the game, sampled for the progress chart."""
+    with open(base + ".pkl", "rb") as f:
+        blob = pickle.load(f)
+    actions = blob["actions"]
+    game = Game([RandomPlayer(c) for c in COLORS[: len(blob["specs"])]], seed=blob["seed"])
+    step = max(1, len(actions) // samples)
+    series = {c.value: [] for c in game.state.colors}
+    marks = []
+    for i, action in enumerate(actions):
+        game.execute(action, validate_action=False)
+        if i % step == 0 or i == len(actions) - 1:
+            marks.append(i + 1)
+            for color in game.state.colors:
+                series[color.value].append(get_actual_victory_points(game.state, color))
+    return marks, series
+
+
+def vp_chart(marks, series, width=560, height=150):
+    if len(marks) < 2:
+        return "<div class=muted>not enough moves yet</div>"
+    top = max(10, max(max(v) for v in series.values()))
+    sx = lambda i: 34 + (width - 44) * marks[i] / marks[-1]
+    sy = lambda v: height - 24 - (height - 40) * v / top
+    out = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img"><title>victory points</title>']
+    for vp in range(0, top + 1, 2):
+        y = sy(vp)
+        out.append(f'<line x1="34" y1="{y:.1f}" x2="{width - 10}" y2="{y:.1f}" stroke="#2e2e26"/>')
+        out.append(f'<text x="26" y="{y:.1f}" text-anchor="end" dominant-baseline="central" font-size="10" fill="#9a978c">{vp}</text>')
+    for color, values in series.items():
+        points = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in enumerate(values))
+        out.append(
+            f'<polyline points="{points}" fill="none" stroke="{SEAT_FILL[color]}" '
+            'stroke-width="2.5" stroke-linejoin="round"/>'
+        )
+    out.append("</svg>")
+    return "".join(out)
+
+
+def decisions(match_name, game_index):
+    path = match_name + "_decisions.jsonl"
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("game") == game_index:
+                rows.append(row)
+    return rows
 
 
 def node_positions(board_map):
@@ -186,15 +245,19 @@ def commentary(match_name, limit=14):
     return lines[-limit:][::-1]
 
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="5"><title>{title}</title><style>
+REFRESH = '<meta http-equiv="refresh" content="5">'
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8">{refresh}<title>{title}</title><style>
 body{{background:#14140f;color:#e8e6df;font:15px/1.6 -apple-system,system-ui,sans-serif;margin:0;padding:24px}}
 a{{color:#e8c96a}} h1{{font-size:20px;font-weight:500;margin:0 0 4px}} h2{{font-size:16px;font-weight:500;margin:24px 0 8px}}
 .muted{{color:#9a978c;font-size:13px}} table{{border-collapse:collapse;width:100%;max-width:900px}}
 td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-size:14px}} th{{color:#9a978c;font-weight:500}}
-.wrap{{display:flex;gap:28px;flex-wrap:wrap}} .board{{flex:1 1 520px;max-width:640px}} .side{{flex:1 1 340px}}
+.wrap{{display:flex;gap:28px;flex-wrap:wrap}} .board{{flex:1 1 520px;max-width:640px}} .side{{flex:1 1 380px}}
 .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px;vertical-align:middle}}
-.log{{font-size:13px;color:#c9c6bb;border-left:2px solid #2e2e26;padding-left:12px;margin:5px 0}}
+.log{{font-size:13px;color:#c9c6bb;border-left:2px solid #2e2e26;padding-left:12px;margin:9px 0}}
+.scrub{{display:flex;align-items:center;gap:14px;margin:16px 0;max-width:900px}}
+.scrub input{{flex:1;accent-color:#e8c96a}}
+.live{{color:#7fae4a;font-size:13px}}
 </style></head><body>{body}</body></html>"""
 
 
@@ -225,12 +288,13 @@ def index_page():
         + ("".join(rows) or "<tr><td colspan=5 class=muted>no matches yet — run ./run_match.sh</td></tr>")
         + "</table>"
     )
-    return PAGE.format(title="Catan LLM arena", body=body)
+    return PAGE.format(title="Catan LLM arena", body=body, refresh=REFRESH)
 
 
-def game_page(base):
-    game, specs, n = load(base)
-    match_name = base.rsplit("_g", 1)[0]
+def game_page(base, at=None):
+    game, specs, n = load(base, upto=at)
+    live = at is None or at >= n
+    match_name, game_index = base.rsplit("_g", 1)[0], int(base.rsplit("_g", 1)[1])
     winner = game.winning_color()
     rows = "".join(
         f"<tr><td><span class=dot style='background:{SEAT_FILL[r['color']]}'></span>{html.escape(r['model'])}</td>"
@@ -239,16 +303,42 @@ def game_page(base):
         f"<td class=muted>{html.escape(r['badges'])}</td></tr>"
         for r in seat_rows(game, specs)
     )
-    logs = "".join(f"<div class=log>{html.escape(line)}</div>" for line in commentary(match_name))
+
+    shown = n if live else at
+    prev_at, next_at = max(0, shown - 1), min(n, shown + 1)
+    scrubber = (
+        f"<div class=scrub><a href='/game?base={base}&at={prev_at}'>&larr; prev</a>"
+        f"<input type=range min=0 max={n} value={shown} id=sc "
+        f"oninput=\"document.getElementById('lab').textContent=this.value\" "
+        f"onchange=\"location='/game?base={base}&at='+this.value\">"
+        f"<a href='/game?base={base}&at={next_at}'>next &rarr;</a>"
+        f"<span class=muted>move <b id=lab>{shown}</b> / {n}</span>"
+        + ("<span class=live>live</span>" if live else f"<a href='/game?base={base}'>back to live</a>")
+        + "</div>"
+    )
+
+    rowsd = decisions(match_name, game_index)
+    timeline = "".join(
+        f"<div class=log><span class=dot style='background:{SEAT_FILL[d['color']]}'></span>"
+        f"<b>{html.escape(d['action'])}</b> "
+        f"<span class=muted>turn {d.get('turn', '?')} &middot; {d.get('seconds', '?')}s &middot; "
+        f"${d.get('cost_usd', 0):.4f} &middot; {html.escape(d['model'].split('/')[-1])}</span><br>"
+        f"{html.escape(d.get('reason', ''))}</div>"
+        for d in rowsd[-25:][::-1]
+    ) or "".join(f"<div class=log>{html.escape(line)}</div>" for line in commentary(match_name))
+
+    marks, series = vp_history(base)
     banner = f"<h2>winner: {winner.value}</h2>" if winner else ""
     body = (
         f"<h1><a href='/'>arena</a> / {html.escape(base)}</h1>"
-        f"<div class=muted>turn {game.state.num_turns} &middot; {n} actions</div>{banner}"
+        f"<div class=muted>turn {game.state.num_turns} &middot; {n} actions recorded</div>{banner}"
+        f"{scrubber}"
         f"<div class=wrap><div class=board>{board_svg(game)}</div>"
         f"<div class=side><h2>seats</h2><table>{rows}</table>"
-        f"<h2>recent decisions</h2>{logs or '<div class=muted>no commentary log found</div>'}</div></div>"
+        f"<h2>victory points over the game</h2>{vp_chart(marks, series)}"
+        f"<h2>decisions</h2>{timeline or '<div class=muted>no decisions logged yet</div>'}</div></div>"
     )
-    return PAGE.format(title=base, body=body)
+    return PAGE.format(title=base, body=body, refresh=REFRESH if live else "")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -256,11 +346,17 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         try:
             if url.path == "/game":
-                page = game_page(parse_qs(url.query)["base"][0])
+                query = parse_qs(url.query)
+                at = query.get("at")
+                page = game_page(query["base"][0], at=int(at[0]) if at else None)
             else:
                 page = index_page()
         except Exception as exc:  # snapshot mid-write, bad param: stay up
-            page = PAGE.format(title="arena", body=f"<h1>hold on</h1><div class=muted>{html.escape(str(exc))}</div>")
+            page = PAGE.format(
+                title="arena",
+                body=f"<h1>hold on</h1><div class=muted>{html.escape(str(exc))}</div>",
+                refresh=REFRESH,
+            )
         data = page.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
