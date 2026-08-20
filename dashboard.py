@@ -231,34 +231,82 @@ def board_svg(game, last_action=None):
     return "".join(out)
 
 
+DEV_CARDS = ["KNIGHT", "VICTORY_POINT", "ROAD_BUILDING", "YEAR_OF_PLENTY", "MONOPOLY"]
+DEV_LABEL = {
+    "KNIGHT": "knight",
+    "VICTORY_POINT": "vp card",
+    "ROAD_BUILDING": "road building",
+    "YEAR_OF_PLENTY": "year of plenty",
+    "MONOPOLY": "monopoly",
+}
+
+
 def seat_rows(game, specs):
     state = game.state
     seats = dict(zip(COLORS, specs))
     rows = []
     for color in state.colors:
         key = player_key(state, color)
-        hand = " ".join(
-            f"{r[:2].lower()} {state.player_state[f'{key}_{r}_IN_HAND']}" for r in RESOURCES
-        )
+        get = lambda field: state.player_state[f"{key}_{field}"]
+        hand = {r: get(f"{r}_IN_HAND") for r in RESOURCES}
+        held = {c: get(f"{c}_IN_HAND") for c in DEV_CARDS}
+        played = {c: get(f"PLAYED_{c}") for c in DEV_CARDS}
         badges = []
         if get_longest_road_color(state) == color:
-            badges.append("longest road")
+            badges.append(f"longest road ({get('LONGEST_ROAD_LENGTH')})")
         if get_largest_army(state)[0] == color:
-            badges.append("largest army")
+            badges.append(f"largest army ({played['KNIGHT']})")
         rows.append(
             {
                 "color": color.value,
                 "model": seats.get(color, "?"),
                 "vp": get_actual_victory_points(state, color),
                 "hand": hand,
+                "cards": sum(hand.values()),
+                "held": held,
+                "played": played,
                 "dev": player_num_dev_cards(state, color),
                 "towns": len(get_player_buildings(state, color, "SETTLEMENT")),
                 "cities": len(get_player_buildings(state, color, "CITY")),
                 "roads": len(get_player_buildings(state, color, "ROAD")),
+                "road_len": get("LONGEST_ROAD_LENGTH"),
                 "badges": ", ".join(badges),
             }
         )
     return sorted(rows, key=lambda r: -r["vp"])
+
+
+def seat_html(rows):
+    """Seat cards: resources as coloured chips, dev cards held vs played."""
+    out = []
+    for r in rows:
+        chips = "".join(
+            f"<span class=chip style='background:{TILE_FILL[res]}'>{res[:2].lower()} "
+            f"<b>{r['hand'][res]}</b></span>"
+            for res in RESOURCES
+        )
+        cards = "".join(
+            f"<span class='chip dev{' spent' if not r['held'][c] else ''}'>{DEV_LABEL[c]}"
+            f" <b>{r['held'][c]}</b>"
+            + (f"<i> +{r['played'][c]} played</i>" if r["played"][c] else "")
+            + "</span>"
+            for c in DEV_CARDS
+            if r["held"][c] or r["played"][c]
+        ) or "<span class=muted>no development cards</span>"
+        danger = " danger" if r["cards"] >= 8 else ""  # robber discards at 8+
+        out.append(
+            f"<div class=seat><div class=seathead>"
+            f"<span class=dot style='background:{SEAT_FILL[r['color']]}'></span>"
+            f"<b>{html.escape(r['model'])}</b><span class=vp>{r['vp']} vp</span></div>"
+            f"<div class=chips>{chips}"
+            f"<span class='chip count{danger}'>{r['cards']} cards</span></div>"
+            f"<div class=chips>{cards}</div>"
+            f"<div class=muted>{r['towns']} settlements &middot; {r['cities']} cities &middot; "
+            f"{r['roads']} roads (longest {r['road_len']})"
+            + (f" &middot; <b>{html.escape(r['badges'])}</b>" if r["badges"] else "")
+            + "</div></div>"
+        )
+    return "".join(out)
 
 
 def commentary(match_name, limit=14):
@@ -282,6 +330,16 @@ td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-siz
 .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px;vertical-align:middle}}
 .log{{font-size:13px;color:#c9c6bb;border-left:2px solid #2e2e26;padding-left:12px;margin:9px 0}}
 .warn{{border-left-color:#a4472c;color:#d9a08c}}
+.seat{{border:1px solid #2e2e26;border-radius:10px;padding:12px 14px;margin:10px 0}}
+.seathead{{display:flex;align-items:center;gap:6px;font-size:14px}}
+.vp{{margin-left:auto;font-weight:500;color:#e8c96a}}
+.chips{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}}
+.chip{{font-size:12px;padding:2px 8px;border-radius:999px;color:#101008;white-space:nowrap}}
+.chip b{{font-weight:500}} .chip i{{font-style:normal;opacity:.75}}
+.chip.count{{background:#3a3a30;color:#e8e6df}}
+.chip.count.danger{{background:#a4472c;color:#fff}}
+.chip.dev{{background:#2e2e26;color:#e8c96a;border:1px solid #4a4a3e}}
+.chip.dev.spent{{color:#9a978c}}
 .scrub{{display:flex;align-items:center;gap:14px;margin:16px 0;max-width:900px}}
 .scrub input{{flex:1;accent-color:#e8c96a}}
 .live{{color:#7fae4a;font-size:13px}}
@@ -428,13 +486,7 @@ def game_page(base, at=None):
     live = at is None or at >= n
     match_name, game_index = base.rsplit("_g", 1)[0], int(base.rsplit("_g", 1)[1])
     winner = game.winning_color()
-    rows = "".join(
-        f"<tr><td><span class=dot style='background:{SEAT_FILL[r['color']]}'></span>{html.escape(r['model'])}</td>"
-        f"<td><b>{r['vp']}</b></td><td class=muted>{html.escape(r['hand'])}</td>"
-        f"<td class=muted>{r['towns']}t {r['cities']}c {r['roads']}r dev{r['dev']}</td>"
-        f"<td class=muted>{html.escape(r['badges'])}</td></tr>"
-        for r in seat_rows(game, specs)
-    )
+    rows = seat_html(seat_rows(game, specs))
 
     shown = n if live else at
     prev_at, next_at = max(0, shown - 1), min(n, shown + 1)
@@ -473,7 +525,7 @@ def game_page(base, at=None):
         f"<div class=muted id=meta>turn {game.state.num_turns} &middot; {n} actions recorded</div>{banner}"
         f"{scrubber}"
         f"<div class=wrap><div class=board id=board>{board_svg(game, last_action(base, shown))}</div>"
-        f"<div class=side><h2>seats</h2><table id=seats>{rows}</table>"
+        f"<div class=side><h2>seats</h2><div id=seats>{rows}</div>"
         f"<h2>victory points over the game</h2>{vp_chart(marks, series)}"
         f"<h2>decisions</h2>{timeline or '<div class=muted>no decisions logged yet</div>'}</div></div>"
     )
@@ -487,13 +539,7 @@ def frame(base, at):
     gap = None
     if 0 < at < len(times) and times[at] and times[at - 1]:
         gap = (times[at] - times[at - 1]) * 1000
-    rows = "".join(
-        f"<tr><td><span class=dot style='background:{SEAT_FILL[r['color']]}'></span>{html.escape(r['model'])}</td>"
-        f"<td><b>{r['vp']}</b></td><td class=muted>{html.escape(r['hand'])}</td>"
-        f"<td class=muted>{r['towns']}t {r['cities']}c {r['roads']}r dev{r['dev']}</td>"
-        f"<td class=muted>{html.escape(r['badges'])}</td></tr>"
-        for r in seat_rows(game, specs)
-    )
+    rows = seat_html(seat_rows(game, specs))
     action = last_action(base, at)
     return {
         "svg": board_svg(game, action),
