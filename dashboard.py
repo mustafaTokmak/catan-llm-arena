@@ -1073,6 +1073,10 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
         raise SystemExit
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    print(f"arena dashboard: http://localhost:{port}")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    port = int(args[0]) if args and args[0].isdigit() else 8765
+    where = next((a for a in args if not a.isdigit()), None)
+    if where:  # match files live wherever the batch wrote them
+        os.chdir(where)
+    print(f"arena dashboard: http://localhost:{port}  (watching {os.getcwd()})")
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()

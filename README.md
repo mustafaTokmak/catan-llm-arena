@@ -54,6 +54,32 @@ Seat specs: `llm:<openrouter-slug>`, plus free scripted baselines `random`,
 `weighted`, `vp`. 2-4 seats per game. Standings print wins, turns, token usage,
 retry counts, and exact dollar cost per seat.
 
+## Running many games at once
+
+One game is an anecdote. `batch.py` runs many matches in parallel, each its own
+resumable process, and reports win rates with confidence intervals:
+
+```bash
+.venv/bin/python batch.py --matches 50 --dir runs
+```
+
+```bash
+.venv/bin/python dashboard.py 8765 runs
+```
+
+Seats rotate per match (match `i` starts the lineup at `i % 4`), so over any
+multiple of four each model plays each turn position equally often — turn order
+is worth real points in Catan and would otherwise ride along with model identity.
+A crashed match restarts with `--resume`; a fatal setup error stops that match
+alone and is reported at the end. Rerun the same command to resume the batch.
+
+`--dry-run` swaps in the free bot seats, which exercises the whole pipeline
+without spending anything — useful for checking parallelism on a new machine.
+
+Measured on this setup: 50 concurrent matches is fine (~25 MB per process, no
+OpenRouter rate limiting at 50 in-flight requests). Reckon on roughly the
+wall-clock of a single game, and $0.10-0.15 per game.
+
 ## How it works
 
 The engine enumerates legal actions each step. For every multi-option decision,
