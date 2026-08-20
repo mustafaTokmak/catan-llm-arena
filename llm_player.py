@@ -12,6 +12,7 @@ import os
 import random
 import re
 import sys
+import time
 
 import httpx
 
@@ -104,17 +105,21 @@ class LLMPlayer(Player):
             )
         payload = {
             "model": self.model,
-            "max_tokens": 4000,  # reasoning models need headroom before content
+            "max_tokens": 6000,  # reasoning models need headroom before content
+            "reasoning": {"effort": "low"},  # a move choice needs no essay
             "usage": {"include": True},  # exact cost accounting per call
             "messages": [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": prompt},
             ],
         }
-        for attempt in (1, 2):  # one retry on transient errors
+        for attempt in range(4):  # real backoff: 429s want patience, not dice
             response = self._http.post(API_URL, json=payload)
-            if response.status_code < 500 and response.status_code != 429:
+            if response.status_code != 429 and response.status_code < 500:
                 break
+            if attempt < 3:
+                wait = float(response.headers.get("retry-after") or 2 * (attempt + 1))
+                time.sleep(min(wait, 15))
         response.raise_for_status()
         data = response.json()
         self.api_calls += 1
