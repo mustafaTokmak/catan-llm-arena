@@ -54,12 +54,26 @@ SEAT_FILL = {"RED": "#d64545", "BLUE": "#3b6fd4", "WHITE": "#e8e6df", "ORANGE": 
 
 
 _cursor = {}  # base -> (actions_applied, game): stepping forward costs one action
+_blobs = {}  # path -> (stat key, blob): playback would otherwise unpickle per frame
+
+
+def snapshot(base):
+    """The recorded game, re-read only when the match writes a new snapshot."""
+    path = base + ".pkl"
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _blobs.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    with open(path, "rb") as f:
+        blob = pickle.load(f)
+    _blobs[path] = (key, blob)
+    return blob
 
 
 def load(base, upto=None):
     """Replay the recorded actions — all of them, or the first `upto` (scrubbing)."""
-    with open(base + ".pkl", "rb") as f:
-        blob = pickle.load(f)
+    blob = snapshot(base)
     actions = blob["actions"]
     target = len(actions) if upto is None else max(0, min(upto, len(actions)))
     applied, game = _cursor.get(base, (0, None))
@@ -72,23 +86,40 @@ def load(base, upto=None):
     return game, blob["specs"], len(actions)
 
 
-def vp_history(base, upto=None, samples=140):
-    """Victory points per seat over time, up to the move being viewed."""
-    with open(base + ".pkl", "rb") as f:
-        blob = pickle.load(f)
+_vp = {}  # base -> (n_actions, samples): one replay per snapshot, not per frame
+
+
+def vp_series(base, samples=140):
+    """[(move, turn, {seat: vp})] sampled across the whole recorded game."""
+    blob = snapshot(base)
     actions = blob["actions"]
-    if upto is not None:
-        actions = actions[:upto]  # scrubbing must not spoil the ending
+    hit = _vp.get(base)
+    if hit and hit[0] == len(actions):
+        return hit[1]
     game = Game([RandomPlayer(c) for c in COLORS[: len(blob["specs"])]], seed=blob["seed"])
     step = max(1, len(actions) // samples)
-    turns, series = [0], {c.value: [0] for c in game.state.colors}
+    out = [(0, 0, {c.value: 0 for c in game.state.colors})]
     for i, action in enumerate(actions):
         game.execute(action, validate_action=False)
         if i % step == 0 or i == len(actions) - 1:
-            turns.append(game.state.num_turns)
-            for color in game.state.colors:
-                series[color.value].append(get_actual_victory_points(game.state, color))
-    return turns, series
+            out.append(
+                (
+                    i + 1,
+                    game.state.num_turns,
+                    {c.value: get_actual_victory_points(game.state, c) for c in game.state.colors},
+                )
+            )
+    _vp[base] = (len(actions), out)
+    return out
+
+
+def vp_history(base, upto=None):
+    """Victory points per seat over time, cut at the move being viewed."""
+    rows = vp_series(base)
+    if upto is not None:  # scrubbing must not spoil the ending
+        rows = [r for r in rows if r[0] <= upto] or rows[:1]
+    turns = [r[1] for r in rows]
+    return turns, {seat: [r[2][seat] for r in rows] for seat in rows[0][2]}
 
 
 def vp_chart(turns, series, labels, width=560, height=196):
@@ -103,22 +134,27 @@ def vp_chart(turns, series, labels, width=560, height=196):
         f'<svg viewBox="0 0 {width} {height}" width="100%" role="img">'
         "<title>victory points over time</title>"
     ]
+    tick = 'font-family="IBM Plex Mono,monospace" font-size="9.5" letter-spacing=".05em"'
     for vp in range(0, top + 1, 2):
         y, win = sy(vp), vp == 10
         out.append(
             f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" '
-            f'stroke="{"#6b6a52" if win else "#2a2a22"}"'
-            + (' stroke-dasharray="5 4"' if win else "")
+            f'stroke="{"#6b6a52" if win else "#26251d"}"'
+            + (' stroke-dasharray="4 5"' if win else "")
             + "/>"
         )
         out.append(
-            f'<text x="{left - 7}" y="{y:.1f}" text-anchor="end" dominant-baseline="central" '
-            f'font-size="10" fill="{"#c9c079" if win else "#8a877c"}">{vp}</text>'
+            f'<text x="{left - 8}" y="{y:.1f}" text-anchor="end" dominant-baseline="central" '
+            f'{tick} fill="{"#c9c079" if win else "#6d6a5c"}">{vp}</text>'
         )
+    out.append(
+        f'<text x="{right}" y="{sy(10) - 7:.1f}" text-anchor="end" {tick} fill="#c9c079" '
+        'opacity=".8">WIN</text>'
+    )
     for t in (0, turns[-1]):
         out.append(
-            f'<text x="{sx(t):.1f}" y="{foot + 15:.1f}" text-anchor="middle" '
-            f'font-size="10" fill="#8a877c">turn {t}</text>'
+            f'<text x="{sx(t):.1f}" y="{foot + 16:.1f}" text-anchor="middle" '
+            f'{tick} fill="#6d6a5c">turn {t}</text>'
         )
     legend = []
     for slot, (color, values) in enumerate(series.items()):
@@ -128,14 +164,22 @@ def vp_chart(turns, series, labels, width=560, height=196):
             f"{sx(t):.1f},{sy(v) + offset:.1f}" for t, v in zip(turns, values)
         )
         out.append(
+            f'<polygon points="{sx(turns[0]):.1f},{foot} {points} {sx(turns[-1]):.1f},{foot}" '
+            f'fill="{SEAT_FILL[color]}" opacity=".07"/>'
+        )
+        out.append(
             f'<polyline points="{points}" fill="none" stroke="{SEAT_FILL[color]}" '
-            'stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>'
+            'stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>'
         )
         ex, ey = sx(turns[-1]), sy(values[-1]) + offset
-        out.append(f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="3.4" fill="{SEAT_FILL[color]}"/>')
         out.append(
-            f'<text x="{ex + 7:.1f}" y="{ey:.1f}" dominant-baseline="central" font-size="11" '
-            f'font-weight="500" fill="{SEAT_FILL[color]}">{values[-1]}</text>'
+            f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="3.2" fill="{SEAT_FILL[color]}" '
+            'stroke="#100f0a" stroke-width="1.5"/>'
+        )
+        out.append(
+            f'<text x="{ex + 8:.1f}" y="{ey:.1f}" dominant-baseline="central" '
+            'font-family="IBM Plex Mono,monospace" font-size="11" font-weight="500" '
+            f'fill="{SEAT_FILL[color]}">{values[-1]}</text>'
         )
         name = short(labels.get(color, "?"))
         legend.append(
@@ -146,20 +190,31 @@ def vp_chart(turns, series, labels, width=560, height=196):
     return "".join(out) + f"<div class=legend>{''.join(legend)}</div>"
 
 
-def decisions(match_name, game_index):
-    path = match_name + "_decisions.jsonl"
+_logs = {}  # path -> (stat key, parsed rows)
+
+
+def read_jsonl(path):
+    """Parsed lines, re-read only when the file grows (playback hits this a lot)."""
     if not os.path.exists(path):
         return []
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _logs.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
     rows = []
     with open(path, errors="replace") as f:
         for line in f:
             try:
-                row = json.loads(line)
+                rows.append(json.loads(line))
             except ValueError:
                 continue
-            if row.get("game") == game_index:
-                rows.append(row)
+    _logs[path] = (key, rows)
     return rows
+
+
+def decisions(match_name, game_index):
+    return [r for r in read_jsonl(match_name + "_decisions.jsonl") if r.get("game") == game_index]
 
 
 def short(spec):
@@ -291,8 +346,8 @@ def board_svg(game, last_action=None):
             spot = at(centers[value[0]])
         if spot:
             out.append(
-                f'<circle cx="{spot[0]:.1f}" cy="{spot[1]:.1f}" r="20" fill="none" '
-                'stroke="#e8c96a" stroke-width="3" opacity="0.95"/>'
+                f'<circle class="lastring" cx="{spot[0]:.1f}" cy="{spot[1]:.1f}" r="20" '
+                'fill="none" stroke="#e8c96a" stroke-width="3" opacity="0.95"/>'
             )
     out.append("</svg>")
     return "".join(out)
@@ -343,45 +398,107 @@ def seat_rows(game, specs):
     return sorted(rows, key=lambda r: -r["vp"])
 
 
+def race_svg(rows, width=600):
+    """The whole standing as one picture: four tokens on the shared race to 10."""
+    tied = max(Counter(r["vp"] for r in rows).values(), default=1)
+    height = 66 + 30 * tied  # tied seats stack upward; give them room
+    left, right, base = 34, width - 34, height - 26
+    x = lambda vp: left + (right - left) * min(vp, 10) / 10
+    out = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img">'
+           "<title>race to 10 victory points</title>"]
+    out.append(
+        f'<line x1="{left}" y1="{base}" x2="{right}" y2="{base}" stroke="#3b3929" stroke-width="1.5"/>'
+    )
+    for vp in range(11):
+        tall = vp % 5 == 0
+        out.append(
+            f'<line x1="{x(vp):.1f}" y1="{base - (7 if tall else 4)}" x2="{x(vp):.1f}" '
+            f'y2="{base}" stroke="{"#6b6a52" if tall else "#33322a"}" stroke-width="1.5"/>'
+        )
+        if tall:
+            out.append(
+                f'<text x="{x(vp):.1f}" y="{base + 15}" text-anchor="middle" font-size="9.5" '
+                'font-family="IBM Plex Mono,monospace" letter-spacing=".08em" '
+                f'fill="{"#c9c079" if vp == 10 else "#6d6a5c"}">{vp}</text>'
+            )
+    stack = Counter()
+    for rank, r in enumerate(rows):
+        vp, cx = r["vp"], x(r["vp"])
+        y = base - 14 - 30 * stack[vp]  # tied seats sit one above the other
+        stack[vp] += 1
+        fill = SEAT_FILL[r["color"]]
+        if rank == 0:
+            out.append(f'<circle cx="{cx:.1f}" cy="{y:.1f}" r="11" fill="{fill}" opacity=".22"/>')
+        out.append(
+            f'<circle cx="{cx:.1f}" cy="{y:.1f}" r="6.5" fill="{fill}" '
+            'stroke="#100f0a" stroke-width="2"/>'
+        )
+        # label above the token, pinned inside the edges so names never collide
+        anchor = "start" if cx < 62 else ("end" if cx > width - 62 else "middle")
+        out.append(
+            f'<text x="{cx:.1f}" y="{y - 13:.1f}" text-anchor="{anchor}" '
+            'font-size="11.5" font-weight="600" letter-spacing="-.01em" '
+            f'fill="{fill}">{short(r["model"])}</text>'
+        )
+    out.append("</svg>")
+    return "".join(out)
+
+
 def seat_html(rows, spent=None):
-    """Seat cards: resources as coloured chips, dev cards held vs played."""
-    out = []
+    """The race track, then one dense line per seat: hand, holdings, spend."""
     spent = spent or {}
-    for r in rows:
+    out = [f"<div class='race rise'>{race_svg(rows)}</div>"]
+    for rank, r in enumerate(rows, 1):
         s = spent.get(r["color"])
         money = (
-            f"<span class=spend>${s['cost']:.4f}</span> over {s['moves']} moves"
-            f" &middot; {s['tokens'] / 1000:.1f}k tokens"
-            + (f" &middot; {s['retries']} retries" if s["retries"] else "")
+            f"<span class=spend>${s['cost']:.4f}</span>"
+            f"<span class=gap>{s['moves']}<span class=sub> moves</span></span>"
+            f"<span class=gap>{s['tokens'] / 1000:.1f}k<span class=sub> tok</span></span>"
+            + (f"<span class='gap warn'>{s['retries']}<span class=sub> retries</span></span>" if s["retries"] else "")
             if s
             else ""
         )
-        chips = "".join(
-            f"<span class=chip style='background:{TILE_FILL[res]}'>{res[:2].lower()} "
-            f"<b>{r['hand'][res]}</b></span>"
+        hand = "".join(
+            f"<span class='rc{'' if r['hand'][res] else ' zero'}' style='--c:{TILE_FILL[res]}' "
+            f"title='{res.lower()}'>{r['hand'][res]}</span>"
             for res in RESOURCES
         )
         cards = "".join(
-            f"<span class='chip dev{' spent' if not r['held'][c] else ''}'>{DEV_LABEL[c]}"
-            f" <b>{r['held'][c]}</b>"
-            + (f"<i> +{r['played'][c]} played</i>" if r["played"][c] else "")
+            f"<span class='dv{'' if r['held'][c] else ' spent'}'>{DEV_LABEL[c]}"
+            f"<b>{r['held'][c]}</b>"
+            + (f"<i>+{r['played'][c]}</i>" if r["played"][c] else "")
             + "</span>"
             for c in DEV_CARDS
             if r["held"][c] or r["played"][c]
-        ) or "<span class=muted>no development cards</span>"
+        )
         danger = " danger" if r["cards"] >= 8 else ""  # robber discards at 8+
         out.append(
-            f"<div class=seat><div class=seathead>"
-            f"<span class=dot style='background:{SEAT_FILL[r['color']]}'></span>"
-            f"<b>{short(r['model'])}</b><span class=vp>{r['vp']} vp</span></div>"
-            f"<div class=chips>{chips}"
-            f"<span class='chip count{danger}'>{r['cards']} cards</span></div>"
-            f"<div class=chips>{cards}</div>"
-            f"<div class=muted>{r['towns']} settlements &middot; {r['cities']} cities &middot; "
-            f"{r['roads']} roads (longest {r['road_len']})"
-            + (f" &middot; <b>{html.escape(r['badges'])}</b>" if r["badges"] else "")
-            + f"</div><div class=muted>{money}</div></div>"
+            f"<div class='srow rise' style='--seat:{SEAT_FILL[r['color']]}'>"
+            f"<div class=line><span class=pos>{rank}</span>"
+            f"<span class=sname>{short(r['model'])}</span>"
+            f"<span class=hand>{hand}<b class='held{danger}'>{r['cards']}</b></span>"
+            f"<span class=svp>{r['vp']}<i>vp</i></span></div>"
+            + (f"<div class='line devs'>{cards}</div>" if cards else "")
+            + f"<div class=facts><span class=sub>towns </span>{r['towns']}"
+            f"<span class=gap><span class=sub>cities </span>{r['cities']}</span>"
+            f"<span class=gap><span class=sub>roads </span>{r['roads']}</span>"
+            + (f"<span class=gap><b>{html.escape(r['badges'])}</b></span>" if r["badges"] else "")
+            + f"<span class=money>{money}</span></div></div>"
         )
+    return "".join(out)
+
+
+SCORING = {"BUILD_SETTLEMENT", "BUILD_CITY"}  # the only moves that move the VP line
+
+
+def timeline_html(merged, limit=30):
+    """Newest-first feed, grouped under the turn each decision belongs to."""
+    out, turn = [], object()
+    for d in merged[-limit:][::-1]:
+        if d.get("turn") != turn:
+            turn = d.get("turn")
+            out.append(f"<div class=turnsep>turn {turn}</div>")
+        out.append(entry_html(d))
     return "".join(out)
 
 
@@ -397,42 +514,165 @@ def commentary(match_name, limit=14):
 
 REFRESH = '<meta http-equiv="refresh" content="5">'
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">{refresh}<title>{title}</title><style>
-body{{background:#14140f;color:#e8e6df;font:15px/1.6 -apple-system,system-ui,sans-serif;margin:0;padding:24px}}
-a{{color:#e8c96a}} h1{{font-size:20px;font-weight:500;margin:0 0 4px}} h2{{font-size:16px;font-weight:500;margin:24px 0 8px}}
-.muted{{color:#9a978c;font-size:13px}} table{{border-collapse:collapse;width:100%;max-width:900px}}
-td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-size:14px}} th{{color:#9a978c;font-weight:500}}
-.page{{max-width:1500px;margin:0 auto}}
-.wrap{{display:grid;grid-template-columns:minmax(440px,1.05fr) minmax(400px,1fr);
-gap:30px;align-items:start}}
-@media (max-width:1080px){{.wrap{{grid-template-columns:1fr}}}}
-.seatgrid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px}}
-.timeline{{max-height:560px;overflow-y:auto;padding-right:6px}}
-.dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px;vertical-align:middle}}
-.log{{font-size:13px;color:#c9c6bb;border-left:2px solid #2e2e26;padding-left:12px;margin:9px 0}}
-.warn{{border-left-color:#a4472c;color:#d9a08c}}
-.seat{{border:1px solid #2e2e26;border-radius:10px;padding:12px 14px;margin:10px 0}}
-.seathead{{display:flex;align-items:center;gap:6px;font-size:14px}}
-.vp{{margin-left:auto;font-weight:500;color:#e8c96a}}
-.chips{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}}
-.chip{{font-size:12px;padding:2px 8px;border-radius:999px;color:#101008;white-space:nowrap}}
-.chip b{{font-weight:500}} .chip i{{font-style:normal;opacity:.75}}
-.chip.count{{background:#3a3a30;color:#e8e6df}}
-.chip.count.danger{{background:#a4472c;color:#fff}}
-.chip.dev{{background:#2e2e26;color:#e8c96a;border:1px solid #4a4a3e}}
-.chip.dev.spent{{color:#9a978c}}
-.scrub{{display:flex;align-items:center;gap:14px;margin:16px 0;max-width:900px}}
-.scrub input{{flex:1;accent-color:#e8c96a}}
-.scrub button{{background:#23231c;color:#e8e6df;border:1px solid #3c3c32;border-radius:6px;
-padding:4px 10px;font-size:13px;cursor:pointer}}
-.scrub button:hover{{background:#2e2e26}}
-.live{{color:#7fae4a;font-size:13px}}
-.legend{{display:flex;flex-wrap:wrap;gap:14px;margin:2px 0 6px;font-size:12px;color:#c9c6bb}}
-.lg{{white-space:nowrap}} .lg b{{font-weight:500;color:#e8e6df}}
-.retry{{font-size:11px;color:#d9a08c;background:#2e211c;border:1px solid #5c3527;
-border-radius:999px;padding:1px 7px;margin-left:6px;white-space:nowrap;cursor:help}}
-.spend{{font-variant-numeric:tabular-nums;color:#7fae4a}}
-</style></head><body>{body}</body></html>"""
+FONTS = (
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+    "family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,400&"
+    "family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600"
+    '&display=swap">'
+)
+
+# A dark table under a lamp: felt and wood for the game, mono telemetry for the
+# machines playing it. Single braces — CSS is substituted, not formatted.
+CSS = """
+:root{
+--ink:#100f0a;--card:#1b1a12;--card2:#191810;--line:#2b2a20;--line2:#3b3929;
+--text:#ece7d9;--dim:#94907e;--faint:#6d6a5c;--gold:#e8c96a;--win:#8fbf5a;--warn:#d9926a;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:var(--text);
+font:15px/1.6 "IBM Plex Sans",-apple-system,system-ui,sans-serif;
+background-image:radial-gradient(120vh 78vh at 28% -12%,#26241a 0%,transparent 62%),
+radial-gradient(88vh 58vh at 88% -4%,#1d1f17 0%,transparent 58%);
+background-attachment:fixed}
+body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.55;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.04'/%3E%3C/svg%3E")}
+a{color:var(--gold);text-decoration:none}
+a:hover{text-decoration:underline}
+h1{font:600 25px/1.15 Fraunces,Georgia,serif;letter-spacing:-.015em;margin:0}
+h2{font:600 10px/1 "IBM Plex Sans",sans-serif;text-transform:uppercase;
+letter-spacing:.16em;color:var(--faint);margin:0 0 11px}
+.page{position:relative;z-index:1;max-width:1560px;margin:0 auto;padding:22px 26px 70px}
+.muted,.sub{color:var(--dim);font-size:13px}
+.sub{font-size:.82em;color:var(--faint);font-weight:400}
+.num,.tele,.spend,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;
+font-variant-numeric:tabular-nums}
+
+.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:baseline;gap:16px;
+flex-wrap:wrap;padding:13px 26px;border-bottom:1px solid var(--line);
+background:rgba(16,15,10,.85);backdrop-filter:blur(14px)}
+.topbar .home{font:500 10px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.18em;
+color:var(--faint)}
+.topbar .meta{margin-left:auto;font-size:12px;color:var(--dim)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;
+border:1px solid var(--line2);font:500 11px "IBM Plex Sans";letter-spacing:.06em;
+text-transform:uppercase;color:var(--dim)}
+.pill.on{color:var(--win);border-color:#3d5a2d}
+.pill.on:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--win);
+animation:beat 2.4s ease-out infinite}
+@keyframes beat{0%{box-shadow:0 0 0 0 rgba(143,191,90,.45)}70%{box-shadow:0 0 0 7px rgba(143,191,90,0)}100%{box-shadow:0 0 0 0 rgba(143,191,90,0)}}
+
+.card{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:14px;
+background:linear-gradient(180deg,#1e1c14,var(--card2));
+box-shadow:0 20px 44px -30px #000,inset 0 1px 0 rgba(255,255,255,.045);padding:15px 17px}
+.wrap{display:grid;grid-template-columns:minmax(450px,1.03fr) minmax(410px,.97fr);
+gap:26px;align-items:start;margin-top:18px}
+@media (max-width:1120px){.wrap{grid-template-columns:1fr}}
+.stack{display:grid;gap:24px}
+.seatgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(275px,1fr));gap:12px}
+
+.boardwrap{padding:6px 4px 2px}
+.boardwrap:before{content:"";position:absolute;left:50%;top:46%;width:76%;height:66%;
+transform:translate(-50%,-50%);pointer-events:none;filter:blur(26px);
+background:radial-gradient(closest-side,rgba(232,201,106,.11),transparent 72%)}
+.lastring{animation:ring 2s ease-out infinite}
+@keyframes ring{0%{opacity:.95}70%{opacity:.15}100%{opacity:.95}}
+
+.race{margin:-4px 0 10px}
+.srow{--seat:#888;position:relative;padding:11px 0 11px 13px;border-top:1px solid var(--line)}
+.srow:before{content:"";position:absolute;left:0;top:11px;bottom:11px;width:2px;background:var(--seat)}
+.srow:last-child{border-bottom:1px solid var(--line)}
+.line{display:flex;align-items:center;gap:10px}
+.pos{font:600 11px Fraunces,serif;color:var(--faint);width:9px}
+.sname{font-weight:600;letter-spacing:-.01em;font-size:14.5px}
+.svp{margin-left:auto;font:600 21px/1 Fraunces,Georgia,serif;color:var(--gold)}
+.svp i{font:500 9px "IBM Plex Sans";font-style:normal;color:var(--faint);
+margin-left:3px;letter-spacing:.12em;text-transform:uppercase}
+/* the hand as five little resource cards, not five pills */
+.hand{display:inline-flex;align-items:center;gap:3px;margin-left:4px}
+.rc{position:relative;width:19px;height:25px;border-radius:3px;background:var(--c);
+display:flex;align-items:flex-end;justify-content:center;padding-bottom:2px;
+font:600 10px "IBM Plex Mono",monospace;color:#14140d;
+box-shadow:inset 0 -2px 0 rgba(0,0,0,.22),0 1px 2px rgba(0,0,0,.4)}
+.rc:before{content:"";position:absolute;top:0;left:0;right:0;height:8px;
+border-radius:3px 3px 0 0;background:rgba(255,255,255,.2)}
+.rc.zero{opacity:.22}
+.held{margin-left:6px;font:500 11px "IBM Plex Mono",monospace;color:var(--dim)}
+.held.danger{color:#f0b9a0}
+.devs{gap:5px;flex-wrap:wrap;margin-top:8px}
+.dv{font:500 10.5px/1.6 "IBM Plex Mono",monospace;padding:1px 7px;border-radius:5px;
+background:#241f14;color:var(--gold);border:1px solid #453a22}
+.dv.spent{color:var(--faint);border-color:var(--line);background:transparent}
+.dv b{font-weight:600;margin-left:5px}
+.dv i{font-style:normal;opacity:.6;margin-left:4px}
+.facts{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--dim);
+letter-spacing:.01em;margin-top:7px;display:flex;flex-wrap:wrap;align-items:baseline}
+.facts b{color:var(--gold);font-weight:500}
+.facts .sub{margin-right:4px}
+.money{margin-left:auto;padding-left:12px}
+.spend{color:var(--win)}
+.gap{margin-left:11px}
+.facts .warn{color:var(--warn)}
+
+.feed{position:relative;max-height:640px;overflow-y:auto;padding:2px 6px 2px 21px;
+scrollbar-width:thin;scrollbar-color:#33322a transparent}
+.feed:before{content:"";position:absolute;left:4px;top:6px;bottom:6px;width:1px;background:var(--line)}
+.turnsep{display:flex;align-items:center;gap:10px;margin:17px 0 9px;
+font:500 10px "IBM Plex Mono",monospace;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)}
+.turnsep:after{content:"";flex:1;height:1px;background:var(--line)}
+.turnsep:first-child{margin-top:2px}
+.entry{position:relative;margin:0 0 15px;--seat:#888}
+.entry:before{content:"";position:absolute;left:-21px;top:6px;width:8px;height:8px;
+border-radius:50%;background:var(--seat);box-shadow:0 0 0 3px var(--ink)}
+.entry.key:before{box-shadow:0 0 0 3px var(--ink),0 0 0 5px rgba(232,201,106,.45)}
+.act{font-weight:600;font-size:14.5px;letter-spacing:-.005em}
+.entry.key .act{color:var(--gold)}
+.entry.waiting .act{color:var(--warn)}
+.tele{font:400 11px "IBM Plex Mono",monospace;color:var(--faint);letter-spacing:.02em;margin-top:1px}
+.why{font:400 14px/1.5 Fraunces,Georgia,serif;font-style:italic;color:#b6b1a0;margin-top:4px}
+.retry{display:inline-block;font:500 10px "IBM Plex Mono",monospace;color:var(--warn);
+background:#2c1e16;border:1px solid #5a3626;border-radius:999px;padding:1px 8px;
+margin-left:8px;vertical-align:1px;cursor:help;text-transform:none;letter-spacing:.04em}
+
+.controls{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:16px}
+.controls input[type=range]{flex:1;min-width:190px;accent-color:var(--gold);height:3px}
+.btn{background:#211f16;color:var(--text);border:1px solid var(--line2);border-radius:8px;
+padding:5px 12px;font:500 12px "IBM Plex Sans";cursor:pointer;transition:.14s ease}
+.btn:hover{background:#2c2919;border-color:#4f4b36;transform:translateY(-1px)}
+.btn:active{transform:none}
+.counter{font:500 12px "IBM Plex Mono",monospace;color:var(--dim)}
+.counter b{color:var(--text)}
+.winner{display:flex;align-items:baseline;gap:10px;margin-top:16px;
+font:600 19px Fraunces,Georgia,serif;color:var(--gold)}
+.winner .sub{font:500 10px "IBM Plex Sans";letter-spacing:.16em;text-transform:uppercase}
+.legend{display:flex;flex-wrap:wrap;gap:15px;margin:8px 2px 0;
+font:400 11px "IBM Plex Mono",monospace;color:var(--dim)}
+.lg b{color:var(--text);font-weight:500;margin-left:3px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+
+table{border-collapse:collapse;width:100%}
+td,th{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);font-size:13.5px}
+th{font:500 10px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.14em;color:var(--faint)}
+tbody tr:hover td,table tr:hover td{background:#1c1b13}
+
+/* first paint only — a live frame swaps innerHTML, and re-animating that flickers */
+@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+.fresh .rise{animation:rise .45s cubic-bezier(.2,.7,.3,1) both}
+.fresh #seats>*:nth-child(2){animation-delay:.04s}
+.fresh #seats>*:nth-child(3){animation-delay:.08s}
+.fresh #seats>*:nth-child(4){animation-delay:.12s}
+.fresh #seats>*:nth-child(5){animation-delay:.16s}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+"""
+
+def page(title, body, refresh=""):
+    """Wrap a body in the shell. Not str.format: the CSS is full of braces."""
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"{refresh}<title>{html.escape(title)}</title>{FONTS}"
+        f"<style>{CSS}</style></head><body>{body}</body></html>"
+    )
 
 
 def index_page():
@@ -455,68 +695,70 @@ def index_page():
         )
         rows.append(
             f"<tr><td><a href='/game?base={html.escape(base)}'>{html.escape(base)}</a></td>"
-            f"<td>{game.state.num_turns}</td><td>{n}</td>"
-            f"<td class=muted>{', '.join(short(s) for s in specs)}</td><td>{status}</td></tr>"
+            f"<td class=mono>{game.state.num_turns}</td><td class=mono>{n}</td>"
+            f"<td class=sub>{', '.join(short(s) for s in specs)}</td><td>{status}</td></tr>"
         )
     board = leaderboard()
     lb = "".join(
-        f"<tr><td>{html.escape(r['model'])}</td><td><b>{r['wins']}</b></td><td>{r['games']}</td>"
-        f"<td class=muted>{r['moves']}</td><td class=muted>{r['retries']}</td>"
-        f"<td class=muted>{r['median_s']:.0f}s</td><td class=muted>${r['cost']:.3f}</td></tr>"
+        f"<tr><td><b>{short(r['model'])}</b></td><td class=mono><b>{r['wins']}</b></td>"
+        f"<td class=mono>{r['games']}</td><td class='mono sub'>{r['moves']}</td>"
+        f"<td class='mono sub'>{r['retries']}</td><td class='mono sub'>{r['median_s']:.0f}s</td>"
+        f"<td class='mono spend'>${r['cost']:.3f}</td></tr>"
         for r in board
     )
     lb_table = (
-        "<h2>models</h2><table><tr><th>model</th><th>wins</th><th>games</th><th>moves</th>"
-        f"<th>retries</th><th>median move</th><th>spend</th></tr>{lb}</table>"
+        "<div class='card rise'><h2>models</h2><table><tr><th>model</th><th>wins</th>"
+        "<th>games</th><th>moves</th><th>retries</th><th>median move</th><th>spend</th></tr>"
+        f"{lb}</table></div>"
         if board
         else ""
     )
     body = (
-        "<div class=page><h1>Catan LLM arena</h1>"
-        "<div class=muted>every match on disk, replayed from its move log"
-        f" &middot; refreshes every 5s</div>{lb_table}<h2>matches</h2><table>"
-        "<tr><th>game</th><th>turn</th><th>actions</th><th>seats</th><th>status</th></tr>"
-        + ("".join(rows) or "<tr><td colspan=5 class=muted>no matches yet — run ./run_match.sh</td></tr>")
-        + "</table></div>"
+        "<div class=topbar><h1>Catan LLM arena</h1>"
+        "<span class='meta mono'>every match on disk, replayed from its move log"
+        " &middot; refreshes every 5s</span></div>"
+        f"<div class='page fresh'><div class=stack>{lb_table}"
+        "<div class='card rise'><h2>matches</h2><table>"
+        "<tr><th>game</th><th>turn</th><th>moves</th><th>seats</th><th>status</th></tr>"
+        + (
+            "".join(rows)
+            or "<tr><td colspan=5 class=sub>no matches yet &mdash; run ./run_match.sh</td></tr>"
+        )
+        + "</table></div></div></div>"
     )
-    return PAGE.format(title="Catan LLM arena", body=body, refresh=REFRESH)
+    return page("Catan LLM arena", body, REFRESH)
 
 
 def action_times(base):
     """Wall-clock time of each recorded action, for real-time playback."""
-    times = []
-    path = base + ".jsonl"
-    if not os.path.exists(path):
-        return times
-    with open(path, errors="replace") as f:
-        for line in f:
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if "i" in row:
-                times.append(row.get("t"))
-    return times
+    return [row["t"] for row in read_jsonl(base + ".jsonl") if "i" in row]
 
 
-def last_action(base, upto):
-    with open(base + ".pkl", "rb") as f:
-        actions = pickle.load(f)["actions"]
-    if upto <= 0 or not actions:  # rewound to the empty board: nothing to ring
-        return None
-    return actions[min(upto, len(actions)) - 1]
+def seats_of(base):
+    """The lineup a game was played with, from its move log's header line."""
+    try:
+        with open(base + ".jsonl", errors="replace") as f:
+            header = json.loads(f.readline())
+    except (OSError, ValueError):
+        return []
+    return [s.removeprefix("llm:") for s in header.get("players", []) if s.startswith("llm:")]
 
 
 def leaderboard():
     """Aggregate every finished game and every logged decision, by model."""
     wins, games = Counter(), Counter()
     for path in sorted(glob.glob("*_results.jsonl")):
+        match_name = path.removesuffix("_results.jsonl")
         with open(path, errors="replace") as f:
             for line in f:
                 try:
                     row = json.loads(line)
                 except ValueError:
                     continue
+                # wins and games must come from the same place, or a model can
+                # end up with more wins than games played
+                for model in seats_of(f"{match_name}_g{row.get('game')}"):
+                    games[model] += 1
                 winner = row.get("winner", "")
                 for spec in set(re.findall(r"llm:[\w./-]+", winner)):
                     wins[spec.removeprefix("llm:")] += 1
@@ -540,15 +782,14 @@ def leaderboard():
                     s["cost"] += row.get("cost_usd") or 0
                 else:
                     s["cost"] = max(s["cost"], row.get("cost_usd") or 0)
-                games[(row.get("model"), path, row.get("game"))] = 1
     rows = []
-    for model, s in stats.items():
-        played = sum(1 for key in games if key[0] == model)
+    for model in stats.keys() | games.keys() | wins.keys():
+        s = stats.get(model, {"moves": 0, "retries": 0, "seconds": [], "cost": 0.0})
         rows.append(
             {
                 "model": model,
                 "wins": wins.get(model, 0),
-                "games": played,
+                "games": games.get(model, 0),
                 "moves": s["moves"],
                 "retries": s["retries"],
                 "median_s": round(statistics.median(s["seconds"]), 1) if s["seconds"] else 0,
@@ -613,8 +854,8 @@ def merge_retries(rows):
 
 
 def entry_html(d):
-    """One timeline row: the move a model made, with any retries folded in."""
-    dot = f"<span class=dot style='background:{SEAT_FILL.get(d.get('color'), '#888')}'></span>"
+    """One decision in the feed: what the model did, why, and what it cost."""
+    seat = SEAT_FILL.get(d.get("color"), "#888")
     model = short(d.get("model", "?"))
     waits = d.get("waits") or []
     badge = ""
@@ -622,19 +863,25 @@ def entry_html(d):
         gave_up = ", ".join(f"{w.get('gave_up_after_s', '?')}s" for w in waits)
         badge = (
             f"<span class=retry title='{html.escape(str(waits[-1].get('error', ''))[:150])}'>"
-            f"&#8635; {len(waits)} retr{'y' if len(waits) == 1 else 'ies'} ({gave_up})</span>"
+            f"&#8635; {len(waits)} retr{'y' if len(waits) == 1 else 'ies'} &middot; {gave_up}</span>"
         )
     if d.get("type") == "waiting":
         return (
-            f"<div class='log warn'>{dot}<b>waiting for {model}</b> {badge}<br>"
-            f"<span class=muted>turn {d.get('turn', '?')} &middot; still retrying</span></div>"
+            f"<div class='entry waiting rise' style='--seat:{seat}'>"
+            f"<div class=act>waiting on {model} {badge}</div>"
+            "<div class=tele>no answer yet &middot; still retrying</div></div>"
         )
+    action = str(d.get("action", "?"))
+    key = " key" if action.split(" ")[0] in SCORING else ""
+    cost = d.get("cost_usd")
+    cost = f" &middot; ${cost:.4f}" if isinstance(cost, (int, float)) and "cost_total" in d else ""
     return (
-        f"<div class=log>{dot}<b>{pretty_action(d.get('action', '?'))}</b> {badge}"
-        f"<div class=muted>turn {d.get('turn', '?')} &middot; {model} &middot; "
-        f"{d.get('seconds', '?')}s &middot; picked {d.get('chose', '?')} of "
-        f"{d.get('options', '?')} options</div>"
-        f"{html.escape(str(d.get('reason', '')))}</div>"
+        f"<div class='entry{key} rise' style='--seat:{seat}'>"
+        f"<div class=act>{pretty_action(action)}{badge}</div>"
+        f"<div class=tele>{model} &middot; {d.get('seconds', '?')}s{cost}"
+        f" &middot; {d.get('chose', '?')} of {d.get('options', '?')} options</div>"
+        + (f"<div class=why>{html.escape(str(d.get('reason', '')))}</div>" if d.get("reason") else "")
+        + "</div>"
     )
 
 
@@ -647,19 +894,19 @@ def game_page(base, at=None):
     rows = seat_html(seat_rows(game, specs), spend(rowsd, game.state.num_turns))
 
     shown = n if live else at
-    prev_at, next_at = max(0, shown - 1), min(n, shown + 1)
+    played = game.state.actions[-1] if game.state.actions else None
     scrubber = (
-        "<div class=scrub>"
-        "<button onclick=\"goto(cur-1)\">&larr;</button>"
+        "<div class=controls>"
+        "<button class=btn onclick=\"goto(cur-1)\">&larr;</button>"
         f"<input type=range min=0 max={n} value={shown} id=sc "
         "oninput=\"lab.textContent=this.value\" onchange=\"play(null);goto(+this.value)\">"
-        "<button onclick=\"goto(cur+1)\">&rarr;</button>"
-        "<button onclick=\"play(900)\">&#9654; play</button>"
-        "<button onclick=\"play(220)\">&#9193; fast</button>"
-        "<button onclick=\"play(0)\">&#9201; real time</button>"
-        "<button onclick=\"play(null)\">&#9208; pause</button>"
-        f"<span class=muted>move <b id=lab>{shown}</b> / <b id=tot>{n}</b></span>"
-        f"<span class=live id=st>{'live' if live else 'paused'}</span>"
+        "<button class=btn onclick=\"goto(cur+1)\">&rarr;</button>"
+        "<button class=btn onclick=\"play(150)\">&#9654; play</button>"
+        "<button class=btn onclick=\"play(18)\">&#9193; fast</button>"
+        "<button class=btn onclick=\"play(0)\">&#9201; real time</button>"
+        "<button class=btn onclick=\"play(null)\">&#9208; pause</button>"
+        f"<span class=counter>move <b id=lab>{shown}</b> / <b id=tot>{n}</b></span>"
+        f"<span class='pill{' on' if live else ''}' id=st>{'live' if live else 'paused'}</span>"
         "</div>"
         f"<script>const BASE={base!r};let cur={shown},N={n},timer=null,liveTimer=null;"
         "async function goto(i){const r=await fetch('/frame?base='+BASE+'&at='+Math.max(0,i));"
@@ -667,48 +914,61 @@ def game_page(base, at=None):
         "tot.textContent=N;board.innerHTML=d.svg;seats.innerHTML=d.seats;"
         "chart.innerHTML=d.chart;meta.textContent=d.meta;"
         "if(d.timeline)tl.innerHTML=d.timeline;return d;}"
+        "setTimeout(()=>document.querySelector('.page').classList.remove('fresh'),1200);"
+        "function setSt(t){st.textContent=t;st.className='pill'+(t==='live'?' on':'');}"
         "function halt(){clearTimeout(timer);clearInterval(timer);timer=null;"
         "clearInterval(liveTimer);liveTimer=null;}"
         "async function step(ms){if(cur>=N){halt();follow();return;}const d=await goto(cur+1);"
         "if(ms===0)timer=setTimeout(()=>step(0),Math.min(d.gap_ms||700,6000));}"
         # wall-clock playback: background tabs clamp timers to 1s, so jump to the
         # move the elapsed time calls for instead of trusting one tick per move
-        "function play(ms){halt();if(ms===null){st.textContent='paused';return;}"
-        "if(cur>=N)cur=0;st.textContent=ms===0?'real time':(ms<500?'fast':'playing');"
+        "function play(ms){halt();if(ms===null){setSt('paused');return;}"
+        "if(cur>=N)cur=0;setSt(ms===0?'real time':(ms<500?'fast':'playing'));"
         "if(ms===0){step(0);return;}const start=Date.now(),from=cur;let busy=false;"
         "timer=setInterval(async()=>{if(busy)return;busy=true;"
         "const want=Math.min(N,from+Math.floor((Date.now()-start)/ms));"
         "if(want>cur)await goto(want);if(cur>=N){halt();follow();}busy=false;},"
         "Math.min(ms,120));}"
-        "function follow(){halt();st.textContent='live';liveTimer=setInterval(()=>goto(1e9),5000);}"
+        "function follow(){halt();setSt('live');liveTimer=setInterval(()=>goto(1e9),5000);}"
         f"{'follow();' if live else ''}</script>"
     )
 
-    timeline = "".join(
-        entry_html(d) for d in merge_retries(rowsd)[-25:][::-1]
-    ) or "".join(f"<div class=log>{html.escape(line)}</div>" for line in commentary(match_name))
+    upto_turn = game.state.num_turns  # scrubbed back: don't show decisions from the future
+    timeline = timeline_html(
+        [d for d in merge_retries(rowsd) if (d.get("turn") or 0) <= upto_turn]
+    ) or "".join(
+        f"<div class=entry><div class=tele>{html.escape(line)}</div></div>"
+        for line in commentary(match_name)
+    )
 
     labels = {c.value: spec for c, spec in zip(COLORS, specs)}
     turns, series = vp_history(base, upto=shown)
     banner = (
-        f"<h2>winner: {short(dict(zip(COLORS, specs)).get(winner, winner.value))}</h2>"
+        f"<div class=winner><span class=sub>winner</span>"
+        f"{short(dict(zip(COLORS, specs)).get(winner, winner.value))}"
+        f"<span class=sub>in {game.state.num_turns} turns</span></div>"
         if winner
         else ""
     )
     body = (
-        "<div class=page>"
-        f"<h1><a href='/'>arena</a> / {html.escape(base)}</h1>"
-        f"<div class=muted id=meta>turn {game.state.num_turns} &middot; {n} actions recorded</div>{banner}"
-        f"{scrubber}"
+        "<div class=topbar><span class=home><a href='/'>&larr; arena</a></span>"
+        f"<h1>{html.escape(match_name)} <span class=sub>game {game_index}</span></h1>"
+        f"<span class='meta mono' id=meta>turn {game.state.num_turns} &middot; "
+        f"{n} moves recorded</span></div>"
+        "<div class='page fresh'>"
+        f"{banner}{scrubber}"
         "<div class=wrap>"
-        f"<div><div id=board>{board_svg(game, last_action(base, shown))}</div>"
-        f"<h2>victory points</h2><div id=chart>{vp_chart(turns, series, labels)}</div></div>"
-        f"<div><h2>seats</h2><div id=seats class=seatgrid>{rows}</div>"
-        "<h2>decisions</h2>"
-        f"<div class=timeline id=tl>{timeline or '<div class=muted>no decisions logged yet</div>'}</div>"
-        "</div></div></div>"
+        "<div class=stack>"
+        f"<div class='card boardwrap'><div id=board>{board_svg(game, played)}</div></div>"
+        f"<div class=card><h2>victory points</h2><div id=chart>"
+        f"{vp_chart(turns, series, labels)}</div></div></div>"
+        f"<div class=stack><div><h2>race to 10</h2>"
+        f"<div id=seats>{rows}</div></div>"
+        "<div><h2>decisions &amp; reasoning</h2>"
+        f"<div class=feed id=tl>{timeline or '<div class=tele>no decisions logged yet</div>'}</div>"
+        "</div></div></div></div>"
     )
-    return PAGE.format(title=base, body=body, refresh="")  # JS follows live, no reload
+    return page(base, body)  # JS follows live, no meta refresh
 
 
 def frame(base, at):
@@ -722,7 +982,7 @@ def frame(base, at):
     rowsd = decisions(match_name, game_index)
     spent = spend(rowsd, game.state.num_turns)
     rows = seat_html(seat_rows(game, specs), spent)
-    action = last_action(base, at)
+    action = game.state.actions[-1] if game.state.actions else None
     at = min(at, n)
     labels = {c.value: spec for c, spec in zip(COLORS, specs)}
     turns, series = vp_history(base, upto=at)
@@ -732,7 +992,7 @@ def frame(base, at):
         "svg": board_svg(game, action),
         "seats": rows,
         "chart": vp_chart(turns, series, labels),
-        "timeline": "".join(entry_html(d) for d in shown[-25:][::-1]),
+        "timeline": timeline_html(shown),
         "gap_ms": gap,
         "at": at,
         "n": n,
@@ -761,21 +1021,20 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/game":
                 query = parse_qs(url.query)
                 at = query.get("at")
-                page = game_page(query["base"][0], at=int(at[0]) if at else None)
+                rendered = game_page(query["base"][0], at=int(at[0]) if at else None)
             else:
-                page = index_page()
+                rendered = index_page()
         except Exception as exc:  # snapshot mid-write, bad param: stay up
             detail = traceback.format_exc()
             print(detail, file=sys.stderr)
-            page = PAGE.format(
-                title="arena",
-                body=(
-                    f"<h1>hold on</h1><div class=muted>{type(exc).__name__}: {html.escape(str(exc))}"
-                    f"</div><pre class=log>{html.escape(detail[-900:])}</pre>"
-                ),
-                refresh=REFRESH,
+            rendered = page(
+                "arena",
+                "<div class=page><h1>hold on</h1>"
+                f"<div class=tele>{type(exc).__name__}: {html.escape(str(exc))}</div>"
+                f"<pre class=tele>{html.escape(detail[-900:])}</pre></div>",
+                REFRESH,
             )
-        data = page.encode()
+        data = rendered.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
