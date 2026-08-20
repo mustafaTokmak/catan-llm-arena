@@ -43,6 +43,13 @@ Move-by-move commentary (each model's stated reasoning and running cost):
 tail -f mymatch.out
 ```
 
+Or watch every match at once in a browser — drawn hex board, seat standings,
+and live commentary at http://localhost:8765 :
+
+```bash
+.venv/bin/python dashboard.py
+```
+
 Seat specs: `llm:<openrouter-slug>`, plus free scripted baselines `random`,
 `weighted`, `vp`. 2-4 seats per game. Standings print wins, turns, token usage,
 fallback counts, and exact dollar cost per seat.
