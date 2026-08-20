@@ -159,6 +159,7 @@ def main():
         datefmt="%H:%M:%S",
         stream=sys.stderr,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per move, not per request
     specs = [s.strip() for s in args.players.split(",")]
     players = [make_player(spec, color) for spec, color in zip(specs, COLORS)]
     labels = {p.color: f"{spec} ({p.color.value})" for spec, p in zip(specs, players)}
