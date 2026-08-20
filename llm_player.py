@@ -27,6 +27,45 @@ from catanatron.state_functions import (
 )
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "catan_move",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "One short sentence."},
+                "action_index": {
+                    "type": "integer",
+                    "description": "Index of the chosen action from the legal list.",
+                },
+            },
+            "required": ["reason", "action_index"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_schema_models = None
+
+
+def supports_schema(model):
+    """Which models can be held to the JSON schema; the rest get asked nicely."""
+    global _schema_models
+    if _schema_models is None:
+        try:
+            catalog = httpx.get(MODELS_URL, timeout=30).json()["data"]
+            _schema_models = {
+                m["id"]
+                for m in catalog
+                if "structured_outputs" in (m.get("supported_parameters") or [])
+            }
+        except Exception:
+            _schema_models = set()  # catalog unreachable: prompt-only is fine
+    return model in _schema_models
 
 SYSTEM = (
     "You are an expert Settlers of Catan player. You get the current game "
@@ -67,6 +106,7 @@ class LLMPlayer(Player):
         self.timeout = timeout
         self.deadline = deadline  # hard wall-clock cap per call: keepalive
         # trickle from some providers defeats httpx's read timeout entirely
+        self.use_schema = supports_schema(model)
         self._http = None  # lazy: lets keyless runs degrade to random moves
         self.api_calls = 0
         self.fallbacks = 0
@@ -117,8 +157,16 @@ class LLMPlayer(Player):
                 {"role": "user", "content": prompt},
             ],
         }
+        if self.use_schema:
+            payload["response_format"] = RESPONSE_FORMAT
+            payload["provider"] = {"require_parameters": True}
         for attempt in range(4):  # real backoff: 429s want patience, not dice
             response = self._post_with_deadline(payload)
+            if response.status_code in (400, 404) and self.use_schema:
+                self.use_schema = False  # provider dropped support mid-match
+                payload.pop("response_format")
+                payload.pop("provider")
+                continue
             if response.status_code != 429 and response.status_code < 500:
                 break
             if attempt < 3:
@@ -215,6 +263,7 @@ if __name__ == "__main__":  # smoke test: one real LLM decision (<0.01 cent)
         llm.last_error,
     )
     print(
-        f"OK model={llm.model} tokens={llm.input_tokens}/{llm.output_tokens} "
+        f"OK model={llm.model} schema={llm.use_schema} "
+        f"tokens={llm.input_tokens}/{llm.output_tokens} "
         f"cost=${llm.cost_usd:.5f} reason={llm.last_reason!r}"
     )
