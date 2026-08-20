@@ -51,6 +51,11 @@ def run_game(players, specs, base, resume):
     if resume and os.path.exists(pkl):
         with open(pkl, "rb") as f:
             blob = pickle.load(f)
+        if blob["specs"] != specs:
+            raise SystemExit(
+                f"{pkl} was recorded with players {blob['specs']} — "
+                "resume with the same lineup or use a new --log name"
+            )
         seed = blob["seed"]
         game = Game(players, seed=seed)
         for action in blob["actions"]:
