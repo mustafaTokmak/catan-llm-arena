@@ -148,7 +148,8 @@ class LLMPlayer(Player):
         started = time.time()
         before = (self.input_tokens, self.output_tokens, self.cost_usd)
         for attempt in itertools.count():  # every move is the model's own
-            deadline = min(self.deadline * 1.6**attempt, self.max_deadline)
+            # cap the exponent: 1.6**1511 overflows, and the deadline is capped anyway
+            deadline = min(self.deadline * 1.6 ** min(attempt, 12), self.max_deadline)
             try:
                 index = self._ask(game, actions, deadline)
                 action = actions[index]
@@ -225,7 +226,10 @@ class LLMPlayer(Player):
     def _retry_wait(exc, attempt):
         response = getattr(exc, "response", None)
         if response is not None and response.status_code == 429:
-            return min(float(response.headers.get("retry-after") or 5 * (attempt + 1)), 30)
+            try:  # Retry-After may be an HTTP-date, which float() would choke on
+                return min(float(response.headers.get("retry-after")), 30)
+            except (TypeError, ValueError):
+                return min(5 * (attempt + 1), 30)
         return min(2 * (attempt + 1), 15)
 
     def _ask(self, game, actions, deadline):
@@ -259,6 +263,8 @@ class LLMPlayer(Player):
             response = self._post_with_deadline(payload, deadline)
         if response.status_code in FATAL_STATUS or response.status_code == 404:
             raise FatalSetupError(f"HTTP {response.status_code}: {response.text[:200]}")
+        if response.status_code == 400:  # already retried without the schema: retrying loops
+            raise FatalSetupError(f"HTTP 400 (bad request): {response.text[:200]}")
         response.raise_for_status()  # 429/5xx: the caller retries
         data = response.json()
         self.api_calls += 1
