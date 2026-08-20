@@ -17,6 +17,7 @@ import pickle
 import re
 import statistics
 import sys
+import traceback
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -280,6 +281,7 @@ td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-siz
 .wrap{{display:flex;gap:28px;flex-wrap:wrap}} .board{{flex:1 1 520px;max-width:640px}} .side{{flex:1 1 380px}}
 .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px;vertical-align:middle}}
 .log{{font-size:13px;color:#c9c6bb;border-left:2px solid #2e2e26;padding-left:12px;margin:9px 0}}
+.warn{{border-left-color:#a4472c;color:#d9a08c}}
 .scrub{{display:flex;align-items:center;gap:14px;margin:16px 0;max-width:900px}}
 .scrub input{{flex:1;accent-color:#e8c96a}}
 .live{{color:#7fae4a;font-size:13px}}
@@ -400,6 +402,27 @@ def leaderboard():
     return sorted(rows, key=lambda r: (-r["wins"], r["median_s"]))
 
 
+def entry_html(d):
+    """Render one timeline row: a move the model chose, or a retry it survived."""
+    dot = f"<span class=dot style='background:{SEAT_FILL.get(d.get('color'), '#888')}'></span>"
+    model = html.escape(str(d.get("model", "?")).split("/")[-1])
+    turn = d.get("turn", "?")
+    if d.get("type") == "retry":
+        return (
+            f"<div class='log warn'>{dot}<b>retry {d.get('attempt', '?')}</b> "
+            f"<span class=muted>turn {turn} &middot; gave up after "
+            f"{d.get('gave_up_after_s', '?')}s &middot; {model}</span><br>"
+            f"{html.escape(str(d.get('error', ''))[:120])}</div>"
+        )
+    return (
+        f"<div class=log>{dot}<b>{html.escape(str(d.get('action', '?')))}</b> "
+        f"<span class=muted>turn {turn} &middot; {d.get('seconds', '?')}s &middot; "
+        f"chose {d.get('chose', '?')}/{d.get('options', '?')} &middot; "
+        f"${d.get('cost_usd', 0):.4f} &middot; {model}</span><br>"
+        f"{html.escape(str(d.get('reason', '')))}</div>"
+    )
+
+
 def game_page(base, at=None):
     game, specs, n = load(base, upto=at)
     live = at is None or at >= n
@@ -440,12 +463,7 @@ def game_page(base, at=None):
 
     rowsd = decisions(match_name, game_index)
     timeline = "".join(
-        f"<div class=log><span class=dot style='background:{SEAT_FILL[d['color']]}'></span>"
-        f"<b>{html.escape(d['action'])}</b> "
-        f"<span class=muted>turn {d.get('turn', '?')} &middot; {d.get('seconds', '?')}s &middot; "
-        f"${d.get('cost_usd', 0):.4f} &middot; {html.escape(d['model'].split('/')[-1])}</span><br>"
-        f"{html.escape(d.get('reason', ''))}</div>"
-        for d in rowsd[-25:][::-1]
+        entry_html(d) for d in rowsd[-25:][::-1]
     ) or "".join(f"<div class=log>{html.escape(line)}</div>" for line in commentary(match_name))
 
     marks, series = vp_history(base)
@@ -506,9 +524,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 page = index_page()
         except Exception as exc:  # snapshot mid-write, bad param: stay up
+            detail = traceback.format_exc()
+            print(detail, file=sys.stderr)
             page = PAGE.format(
                 title="arena",
-                body=f"<h1>hold on</h1><div class=muted>{html.escape(str(exc))}</div>",
+                body=(
+                    f"<h1>hold on</h1><div class=muted>{type(exc).__name__}: {html.escape(str(exc))}"
+                    f"</div><pre class=log>{html.escape(detail[-900:])}</pre>"
+                ),
                 refresh=REFRESH,
             )
         data = page.encode()
