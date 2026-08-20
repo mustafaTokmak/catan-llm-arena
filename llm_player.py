@@ -13,6 +13,7 @@ model, no credit) stop a match, loudly.
 
 import itertools
 import json
+import logging
 import os
 import re
 import sys
@@ -52,6 +53,8 @@ RESPONSE_FORMAT = {
         },
     },
 }
+
+log = logging.getLogger("arena")
 
 _schema_models = None
 
@@ -142,56 +145,79 @@ class LLMPlayer(Player):
         actions = list(playable_actions)
         if len(actions) == 1:  # forced move (roll, end turn): skip the API
             return actions[0]
-        started = time.time()
+        started, before = time.time(), (self.input_tokens, self.output_tokens)
         for attempt in itertools.count():  # every move is the model's own
             deadline = min(self.deadline * 1.6**attempt, self.max_deadline)
             try:
-                action = actions[self._ask(game, actions, deadline)]
+                index = self._ask(game, actions, deadline)
+                action = actions[index]
             except FatalSetupError:
                 raise
             except Exception as exc:
                 self.retries += 1
                 self.last_error = repr(exc)[:200]
                 wait = self._retry_wait(exc, attempt)
-                self._log(
-                    f"RETRY (attempt {attempt + 1} gave up at {deadline:.0f}s, "
-                    f"waiting {wait:.0f}s) {self.last_error[:70]}"
+                log.warning(
+                    "[%s] retry %d after %.0fs: %s (waiting %.0fs)",
+                    self.model,
+                    attempt + 1,
+                    deadline,
+                    self.last_error[:90],
+                    wait,
+                )
+                self._write(
+                    {
+                        "type": "retry",
+                        "turn": game.state.num_turns,
+                        "attempt": attempt + 1,
+                        "gave_up_after_s": round(deadline, 1),
+                        "error": self.last_error[:200],
+                    }
                 )
                 time.sleep(wait)
                 continue
             value = "" if action.value is None else f" {action.value}"
-            self._log(
-                f"{action.action_type.value}{value} "
-                f"(${self.cost_usd:.4f} total) {self.last_reason[:70]}"
+            seconds = time.time() - started
+            log.info(
+                "[%s] %s%s | %.0fs $%.4f | %s",
+                self.model,
+                action.action_type.value,
+                value,
+                seconds,
+                self.cost_usd,
+                self.last_reason[:80],
             )
-            self._record(game, action, value, time.time() - started)
+            self._write(
+                {
+                    "type": "move",
+                    "turn": game.state.num_turns,
+                    "action": f"{action.action_type.value}{value}",
+                    "reason": self.last_reason,
+                    "chose": index,
+                    "options": len(actions),
+                    "seconds": round(seconds, 1),
+                    "attempts": attempt + 1,
+                    "schema": self.use_schema,
+                    "tokens_in": self.input_tokens - before[0],
+                    "tokens_out": self.output_tokens - before[1],
+                    "cost_usd": round(self.cost_usd, 5),
+                }
+            )
             return action
 
-    def _record(self, game, action, value, seconds):
-        """One line per decision: what the model did, why, and what it cost."""
+    def _write(self, row):
+        """Machine-readable timeline: one line per move or retry, for the UI."""
         if not self.decisions_path:
             return
+        row = {
+            "t": time.time(),
+            "game": self.game_index,
+            "color": self.color.value,
+            "model": self.model,
+            **row,
+        }
         with open(self.decisions_path, "a") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "t": time.time(),
-                        "game": self.game_index,
-                        "turn": game.state.num_turns,
-                        "color": self.color.value,
-                        "model": self.model,
-                        "action": f"{action.action_type.value}{value}",
-                        "reason": self.last_reason,
-                        "seconds": round(seconds, 1),
-                        "retries": self.retries,
-                        "cost_usd": round(self.cost_usd, 5),
-                    }
-                )
-                + "\n"
-            )
-
-    def _log(self, text):  # live progress: tail -f the match log
-        print(f"{time.strftime('%H:%M:%S')} [{self.model}] {text}", file=sys.stderr, flush=True)
+            f.write(json.dumps(row) + "\n")
 
     @staticmethod
     def _retry_wait(exc, attempt):

@@ -14,8 +14,10 @@ import json
 import math
 import os
 import pickle
+import re
+import statistics
 import sys
-import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -50,14 +52,22 @@ TILE_FILL = {
 SEAT_FILL = {"RED": "#d64545", "BLUE": "#3b6fd4", "WHITE": "#e8e6df", "ORANGE": "#e08a2e"}
 
 
+_cursor = {}  # base -> (actions_applied, game): stepping forward costs one action
+
+
 def load(base, upto=None):
     """Replay the recorded actions — all of them, or the first `upto` (scrubbing)."""
     with open(base + ".pkl", "rb") as f:
         blob = pickle.load(f)
     actions = blob["actions"]
-    game = Game([RandomPlayer(c) for c in COLORS[: len(blob["specs"])]], seed=blob["seed"])
-    for action in actions[:upto] if upto is not None else actions:
+    target = len(actions) if upto is None else max(0, min(upto, len(actions)))
+    applied, game = _cursor.get(base, (0, None))
+    if game is None or applied > target:  # rewind: replay from the start
+        game = Game([RandomPlayer(c) for c in COLORS[: len(blob["specs"])]], seed=blob["seed"])
+        applied = 0
+    for action in actions[applied:target]:
         game.execute(action, validate_action=False)
+    _cursor[base] = (target, game)
     return game, blob["specs"], len(actions)
 
 
@@ -129,7 +139,7 @@ def node_positions(board_map):
     return positions, centers
 
 
-def board_svg(game):
+def board_svg(game, last_action=None):
     state = game.state
     board = state.board
     positions, centers = node_positions(board.map)
@@ -200,6 +210,21 @@ def board_svg(game):
                 f'fill="{fill}" stroke="#1c1c1a" stroke-width="2.5"/>'
                 f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="middle" dominant-baseline="central" '
                 'font-size="11" font-weight="600" fill="#1c1c1a">C</text>'
+            )
+    if last_action is not None:  # ring whatever just changed
+        value = last_action.value
+        spot = None
+        if isinstance(value, int) and value in positions:
+            spot = at(positions[value])
+        elif isinstance(value, tuple) and len(value) == 2 and value[0] in positions:
+            (x1, y1), (x2, y2) = at(positions[value[0]]), at(positions[value[1]])
+            spot = ((x1 + x2) / 2, (y1 + y2) / 2)
+        elif isinstance(value, tuple) and value and isinstance(value[0], tuple):
+            spot = at(centers.get(value[0], (0, 0)))
+        if spot:
+            out.append(
+                f'<circle cx="{spot[0]:.1f}" cy="{spot[1]:.1f}" r="20" fill="none" '
+                'stroke="#e8c96a" stroke-width="3" opacity="0.95"/>'
             )
     out.append("</svg>")
     return "".join(out)
@@ -281,14 +306,98 @@ def index_page():
             f"<td>{game.state.num_turns}</td><td>{n}</td>"
             f"<td class=muted>{html.escape(', '.join(specs))}</td><td>{status}</td></tr>"
         )
+    board = leaderboard()
+    lb = "".join(
+        f"<tr><td>{html.escape(r['model'])}</td><td><b>{r['wins']}</b></td><td>{r['games']}</td>"
+        f"<td class=muted>{r['moves']}</td><td class=muted>{r['retries']}</td>"
+        f"<td class=muted>{r['median_s']:.0f}s</td><td class=muted>${r['cost']:.3f}</td></tr>"
+        for r in board
+    )
+    lb_table = (
+        "<h2>models</h2><table><tr><th>model</th><th>wins</th><th>games</th><th>moves</th>"
+        f"<th>retries</th><th>median move</th><th>spend</th></tr>{lb}</table>"
+        if board
+        else ""
+    )
     body = (
         "<h1>Catan LLM arena</h1><div class=muted>every match on disk, replayed from its move log"
-        " &middot; refreshes every 5s</div><h2>matches</h2><table>"
+        f" &middot; refreshes every 5s</div>{lb_table}<h2>matches</h2><table>"
         "<tr><th>game</th><th>turn</th><th>actions</th><th>seats</th><th>status</th></tr>"
         + ("".join(rows) or "<tr><td colspan=5 class=muted>no matches yet — run ./run_match.sh</td></tr>")
         + "</table>"
     )
     return PAGE.format(title="Catan LLM arena", body=body, refresh=REFRESH)
+
+
+def action_times(base):
+    """Wall-clock time of each recorded action, for real-time playback."""
+    times = []
+    path = base + ".jsonl"
+    if not os.path.exists(path):
+        return times
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if "i" in row:
+                times.append(row.get("t"))
+    return times
+
+
+def last_action(base, upto):
+    with open(base + ".pkl", "rb") as f:
+        actions = pickle.load(f)["actions"]
+    return actions[upto - 1] if 0 < upto <= len(actions) else (actions[-1] if actions else None)
+
+
+def leaderboard():
+    """Aggregate every finished game and every logged decision, by model."""
+    wins, games = Counter(), Counter()
+    for path in sorted(glob.glob("*_results.jsonl")):
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                winner = row.get("winner", "")
+                for spec in set(re.findall(r"llm:[\w./-]+", winner)):
+                    wins[spec.removeprefix("llm:")] += 1
+    stats = {}
+    for path in sorted(glob.glob("*_decisions.jsonl")):
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                s = stats.setdefault(
+                    row.get("model", "?"), {"moves": 0, "retries": 0, "seconds": [], "cost": 0.0}
+                )
+                if row.get("type") == "retry":
+                    s["retries"] += 1
+                    continue
+                s["moves"] += 1
+                s["seconds"].append(row.get("seconds", 0))
+                s["cost"] = max(s["cost"], row.get("cost_usd", 0))
+                games[(row.get("model"), path, row.get("game"))] = 1
+    rows = []
+    for model, s in stats.items():
+        played = sum(1 for key in games if key[0] == model)
+        rows.append(
+            {
+                "model": model,
+                "wins": wins.get(model, 0),
+                "games": played,
+                "moves": s["moves"],
+                "retries": s["retries"],
+                "median_s": round(statistics.median(s["seconds"]), 1) if s["seconds"] else 0,
+                "cost": s["cost"],
+            }
+        )
+    return sorted(rows, key=lambda r: (-r["wins"], r["median_s"]))
 
 
 def game_page(base, at=None):
@@ -307,14 +416,26 @@ def game_page(base, at=None):
     shown = n if live else at
     prev_at, next_at = max(0, shown - 1), min(n, shown + 1)
     scrubber = (
-        f"<div class=scrub><a href='/game?base={base}&at={prev_at}'>&larr; prev</a>"
+        f"<div class=scrub><a href='/game?base={base}&at={prev_at}'>&larr;</a>"
         f"<input type=range min=0 max={n} value={shown} id=sc "
-        f"oninput=\"document.getElementById('lab').textContent=this.value\" "
-        f"onchange=\"location='/game?base={base}&at='+this.value\">"
-        f"<a href='/game?base={base}&at={next_at}'>next &rarr;</a>"
+        f"oninput=\"lab.textContent=this.value\" onchange=\"goto(+this.value)\">"
+        f"<a href='/game?base={base}&at={next_at}'>&rarr;</a>"
+        "<button onclick=\"play(900)\">&#9654; play</button>"
+        "<button onclick=\"play(220)\">&#9193; fast</button>"
+        "<button onclick=\"play(0)\">&#9201; real time</button>"
+        "<button onclick=\"stop()\">&#9208; pause</button>"
         f"<span class=muted>move <b id=lab>{shown}</b> / {n}</span>"
-        + ("<span class=live>live</span>" if live else f"<a href='/game?base={base}'>back to live</a>")
+        + ("<span class=live>live</span>" if live else f"<a href='/game?base={base}'>live</a>")
         + "</div>"
+        f"<script>const BASE={base!r},N={n};let cur={shown},timer=null,mode=900;"
+        "function stop(){clearTimeout(timer);clearInterval(timer);timer=null;}"
+        "async function goto(i){cur=i;const r=await fetch('/frame?base='+BASE+'&at='+i);"
+        "const d=await r.json();board.innerHTML=d.svg;seats.innerHTML=d.seats;"
+        "lab.textContent=i;sc.value=i;meta.textContent=d.meta;return d;}"
+        "async function step(){if(cur>=N){stop();return;}const d=await goto(cur+1);"
+        "if(mode===0)timer=setTimeout(step,Math.min(d.gap_ms||600,6000));}"
+        "function play(ms){stop();mode=ms;if(ms===0){step();}else{timer=setInterval(step,ms);}}"
+        "</script>"
     )
 
     rowsd = decisions(match_name, game_index)
@@ -331,20 +452,53 @@ def game_page(base, at=None):
     banner = f"<h2>winner: {winner.value}</h2>" if winner else ""
     body = (
         f"<h1><a href='/'>arena</a> / {html.escape(base)}</h1>"
-        f"<div class=muted>turn {game.state.num_turns} &middot; {n} actions recorded</div>{banner}"
+        f"<div class=muted id=meta>turn {game.state.num_turns} &middot; {n} actions recorded</div>{banner}"
         f"{scrubber}"
-        f"<div class=wrap><div class=board>{board_svg(game)}</div>"
-        f"<div class=side><h2>seats</h2><table>{rows}</table>"
+        f"<div class=wrap><div class=board id=board>{board_svg(game, last_action(base, shown))}</div>"
+        f"<div class=side><h2>seats</h2><table id=seats>{rows}</table>"
         f"<h2>victory points over the game</h2>{vp_chart(marks, series)}"
         f"<h2>decisions</h2>{timeline or '<div class=muted>no decisions logged yet</div>'}</div></div>"
     )
     return PAGE.format(title=base, body=body, refresh=REFRESH if live else "")
 
 
+def frame(base, at):
+    """One playback frame: board + seats, and how long the real move took."""
+    game, specs, n = load(base, upto=at)
+    times = action_times(base)
+    gap = None
+    if 0 < at < len(times) and times[at] and times[at - 1]:
+        gap = (times[at] - times[at - 1]) * 1000
+    rows = "".join(
+        f"<tr><td><span class=dot style='background:{SEAT_FILL[r['color']]}'></span>{html.escape(r['model'])}</td>"
+        f"<td><b>{r['vp']}</b></td><td class=muted>{html.escape(r['hand'])}</td>"
+        f"<td class=muted>{r['towns']}t {r['cities']}c {r['roads']}r dev{r['dev']}</td>"
+        f"<td class=muted>{html.escape(r['badges'])}</td></tr>"
+        for r in seat_rows(game, specs)
+    )
+    action = last_action(base, at)
+    return {
+        "svg": board_svg(game, action),
+        "seats": rows,
+        "gap_ms": gap,
+        "meta": f"turn {game.state.num_turns} · move {at} / {n}"
+        + (f" · {action.color.value} {action.action_type.value}" if action else ""),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         try:
+            if url.path == "/frame":
+                query = parse_qs(url.query)
+                payload = json.dumps(frame(query["base"][0], int(query["at"][0]))).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if url.path == "/game":
                 query = parse_qs(url.query)
                 at = query.get("at")

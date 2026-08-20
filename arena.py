@@ -16,12 +16,14 @@ Examples (needs OPENROUTER_API_KEY in env or .env):
 
 import argparse
 import json
+import logging
 import os
 import pickle
 import random
+import statistics
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 
 from catanatron import Color, Game, RandomPlayer
 from catanatron.players.search import VictoryPointPlayer
@@ -29,6 +31,46 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 
 COLORS = [Color.RED, Color.BLUE, Color.WHITE, Color.ORANGE]
 TURN_CAP = 1000
+log = logging.getLogger("arena")
+
+
+def model_stats(decisions_path):
+    """Per-model summary from the decision log: speed, retries, spend."""
+    moves, retries, seconds, tokens = (
+        defaultdict(int),
+        defaultdict(int),
+        defaultdict(list),
+        defaultdict(int),
+    )
+    cost = {}
+    if not os.path.exists(decisions_path):
+        return []
+    with open(decisions_path, errors="replace") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            model = row.get("model", "?")
+            if row.get("type") == "retry":
+                retries[model] += 1
+                continue
+            moves[model] += 1
+            seconds[model].append(row.get("seconds", 0))
+            tokens[model] += (row.get("tokens_in") or 0) + (row.get("tokens_out") or 0)
+            cost[model] = row.get("cost_usd", cost.get(model, 0))
+    return [
+        {
+            "model": model,
+            "moves": moves[model],
+            "retries": retries[model],
+            "median_s": round(statistics.median(seconds[model]), 1),
+            "slowest_s": round(max(seconds[model]), 1),
+            "tokens": tokens[model],
+            "cost": cost.get(model, 0),
+        }
+        for model in sorted(moves, key=lambda m: -moves[m])
+    ]
 
 
 def make_player(spec, color):
@@ -111,10 +153,18 @@ def main():
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
     specs = [s.strip() for s in args.players.split(",")]
     players = [make_player(spec, color) for spec, color in zip(specs, COLORS)]
     labels = {p.color: f"{spec} ({p.color.value})" for spec, p in zip(specs, players)}
     results_path = args.log + "_results.jsonl"
+    decisions_path = args.log + "_decisions.jsonl"
+    log.info("match %s: %d game(s), seats %s", args.log, args.games, ", ".join(specs))
 
     results = []
     if args.resume and os.path.exists(results_path):
@@ -128,7 +178,7 @@ def main():
                 specs,
                 f"{args.log}_g{i}",
                 args.resume,
-                decisions_path=args.log + "_decisions.jsonl",
+                decisions_path=decisions_path,
                 game_index=i,
             )
         except Exception as exc:
@@ -145,20 +195,20 @@ def main():
         results.append(record)
         with open(results_path, "a") as f:
             f.write(json.dumps(record) + "\n")
-        print(f"game {i + 1:>3}: {record['winner']:<40} in {record['turns']} turns", flush=True)
+        log.info("game %d finished: %s in %d turns", i + 1, record["winner"], record["turns"])
 
     wins = Counter(r["winner"] for r in results)
     avg_turns = sum(r["turns"] for r in results) / len(results)
     print(f"\n=== standings after {len(results)} games (avg {avg_turns:.0f} turns) ===")
     for label, n in wins.most_common():
         print(f"{label:<42} {n:>4} wins  ({100 * n / len(results):.0f}%)")
-    for player in players:
-        if hasattr(player, "api_calls"):
+    stats = model_stats(decisions_path)
+    if stats:
+        print(f"\n{'model':<34}{'moves':>7}{'retries':>9}{'median':>8}{'slowest':>9}{'tokens':>9}{'cost':>9}")
+        for s in stats:
             print(
-                f"[{labels[player.color]}] this session: api_calls={player.api_calls} "
-                f"retries={player.retries} "
-                f"tokens={player.input_tokens}/{player.output_tokens} "
-                f"cost=${player.cost_usd:.4f}"
+                f"{s['model']:<34}{s['moves']:>7}{s['retries']:>9}{s['median_s']:>7.0f}s"
+                f"{s['slowest_s']:>8.0f}s{s['tokens']:>9}{s['cost']:>8.4f}$"
             )
 
 
