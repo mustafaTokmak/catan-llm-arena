@@ -13,6 +13,8 @@ import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 
 import httpx
 
@@ -59,10 +61,12 @@ def _api_key():
 
 
 class LLMPlayer(Player):
-    def __init__(self, color, model="deepseek/deepseek-v4-flash", timeout=90.0):
+    def __init__(self, color, model="deepseek/deepseek-v4-flash", timeout=90.0, deadline=75.0):
         super().__init__(color)
         self.model = model
         self.timeout = timeout
+        self.deadline = deadline  # hard wall-clock cap per call: keepalive
+        # trickle from some providers defeats httpx's read timeout entirely
         self._http = None  # lazy: lets keyless runs degrade to random moves
         self.api_calls = 0
         self.fallbacks = 0
@@ -114,7 +118,7 @@ class LLMPlayer(Player):
             ],
         }
         for attempt in range(4):  # real backoff: 429s want patience, not dice
-            response = self._http.post(API_URL, json=payload)
+            response = self._post_with_deadline(payload)
             if response.status_code != 429 and response.status_code < 500:
                 break
             if attempt < 3:
@@ -148,6 +152,17 @@ class LLMPlayer(Player):
             raise ValueError(f"action_index {index} out of range")
         return index
 
+    def _post_with_deadline(self, payload):
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            return pool.submit(self._http.post, API_URL, json=payload).result(
+                timeout=self.deadline
+            )
+        except FutureTimeout:
+            raise TimeoutError(f"no response within {self.deadline}s") from None
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def build_prompt(self, game, actions):
         # ponytail: v0 prompt = scores + hand + action list, no board geometry.
         # Upgrade path: serialize tiles/ports/buildings when moves look blind.
@@ -167,9 +182,14 @@ class LLMPlayer(Player):
             f"Your hand: {hand}.",
             f"Your victory points: {get_actual_victory_points(state, self.color)}/10.",
             f"Opponents: {opponents}.",
-            "",
-            "Legal actions:",
         ]
+        recent = state.actions[-12:]
+        if recent:
+            lines.append("Recent moves:")
+            for a in recent:
+                value = "" if a.value is None else f" {a.value}"
+                lines.append(f"- {a.color.value}: {a.action_type.value}{value}")
+        lines += ["", "Legal actions:"]
         for i, action in enumerate(actions[:MAX_ACTIONS_LISTED]):
             value = "" if action.value is None else f" {action.value}"
             lines.append(f"{i}: {action.action_type.value}{value}")
