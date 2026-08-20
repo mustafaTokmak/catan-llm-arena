@@ -24,10 +24,23 @@ One decision smoke test (fraction of a cent):
 .venv/bin/python llm_player.py
 ```
 
-A 3-model match of the currently most popular open-weights models:
+Run a durable match (auto-resumes on crash/hang until finished):
 
 ```bash
-.venv/bin/python arena.py --games 1 --players "llm:deepseek/deepseek-v4-flash-0731,llm:tencent/hy3,llm:xiaomi/mimo-v2.5"
+./run_match.sh mymatch "llm:z-ai/glm-5.2,llm:deepseek/deepseek-v4-flash,llm:qwen/qwen3.7-flash"
+```
+
+Watch it live from another terminal — board tiles, VPs, hands, buildings,
+last moves (state is reconstructed exactly from the move log):
+
+```bash
+.venv/bin/python watch.py mymatch_g0 --follow
+```
+
+Move-by-move commentary (each model's stated reasoning and running cost):
+
+```bash
+tail -f mymatch.out
 ```
 
 Seat specs: `llm:<openrouter-slug>`, plus free scripted baselines `random`,
