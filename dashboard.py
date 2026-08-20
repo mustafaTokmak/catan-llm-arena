@@ -342,6 +342,9 @@ td,th{{text-align:left;padding:6px 10px;border-bottom:1px solid #2e2e26;font-siz
 .chip.dev.spent{{color:#9a978c}}
 .scrub{{display:flex;align-items:center;gap:14px;margin:16px 0;max-width:900px}}
 .scrub input{{flex:1;accent-color:#e8c96a}}
+.scrub button{{background:#23231c;color:#e8e6df;border:1px solid #3c3c32;border-radius:6px;
+padding:4px 10px;font-size:13px;cursor:pointer}}
+.scrub button:hover{{background:#2e2e26}}
 .live{{color:#7fae4a;font-size:13px}}
 </style></head><body>{body}</body></html>"""
 
@@ -491,26 +494,38 @@ def game_page(base, at=None):
     shown = n if live else at
     prev_at, next_at = max(0, shown - 1), min(n, shown + 1)
     scrubber = (
-        f"<div class=scrub><a href='/game?base={base}&at={prev_at}'>&larr;</a>"
+        "<div class=scrub>"
+        "<button onclick=\"goto(cur-1)\">&larr;</button>"
         f"<input type=range min=0 max={n} value={shown} id=sc "
-        f"oninput=\"lab.textContent=this.value\" onchange=\"goto(+this.value)\">"
-        f"<a href='/game?base={base}&at={next_at}'>&rarr;</a>"
+        "oninput=\"lab.textContent=this.value\" onchange=\"play(null);goto(+this.value)\">"
+        "<button onclick=\"goto(cur+1)\">&rarr;</button>"
         "<button onclick=\"play(900)\">&#9654; play</button>"
         "<button onclick=\"play(220)\">&#9193; fast</button>"
         "<button onclick=\"play(0)\">&#9201; real time</button>"
-        "<button onclick=\"stop()\">&#9208; pause</button>"
-        f"<span class=muted>move <b id=lab>{shown}</b> / {n}</span>"
-        + ("<span class=live>live</span>" if live else f"<a href='/game?base={base}'>live</a>")
-        + "</div>"
-        f"<script>const BASE={base!r},N={n};let cur={shown},timer=null,mode=900;"
-        "function stop(){clearTimeout(timer);clearInterval(timer);timer=null;}"
-        "async function goto(i){cur=i;const r=await fetch('/frame?base='+BASE+'&at='+i);"
-        "const d=await r.json();board.innerHTML=d.svg;seats.innerHTML=d.seats;"
-        "lab.textContent=i;sc.value=i;meta.textContent=d.meta;return d;}"
-        "async function step(){if(cur>=N){stop();return;}const d=await goto(cur+1);"
-        "if(mode===0)timer=setTimeout(step,Math.min(d.gap_ms||600,6000));}"
-        "function play(ms){stop();mode=ms;if(ms===0){step();}else{timer=setInterval(step,ms);}}"
-        "</script>"
+        "<button onclick=\"play(null)\">&#9208; pause</button>"
+        f"<span class=muted>move <b id=lab>{shown}</b> / <b id=tot>{n}</b></span>"
+        f"<span class=live id=st>{'live' if live else 'paused'}</span>"
+        "</div>"
+        f"<script>const BASE={base!r};let cur={shown},N={n},timer=null,liveTimer=null;"
+        "async function goto(i){const r=await fetch('/frame?base='+BASE+'&at='+Math.max(0,i));"
+        "const d=await r.json();cur=d.at;N=d.n;sc.max=N;sc.value=cur;lab.textContent=cur;"
+        "tot.textContent=N;board.innerHTML=d.svg;seats.innerHTML=d.seats;meta.textContent=d.meta;"
+        "return d;}"
+        "function halt(){clearTimeout(timer);clearInterval(timer);timer=null;"
+        "clearInterval(liveTimer);liveTimer=null;}"
+        "async function step(ms){if(cur>=N){halt();follow();return;}const d=await goto(cur+1);"
+        "if(ms===0)timer=setTimeout(()=>step(0),Math.min(d.gap_ms||700,6000));}"
+        # wall-clock playback: background tabs clamp timers to 1s, so jump to the
+        # move the elapsed time calls for instead of trusting one tick per move
+        "function play(ms){halt();if(ms===null){st.textContent='paused';return;}"
+        "if(cur>=N)cur=0;st.textContent=ms===0?'real time':(ms<500?'fast':'playing');"
+        "if(ms===0){step(0);return;}const start=Date.now(),from=cur;let busy=false;"
+        "timer=setInterval(async()=>{if(busy)return;busy=true;"
+        "const want=Math.min(N,from+Math.floor((Date.now()-start)/ms));"
+        "if(want>cur)await goto(want);if(cur>=N){halt();follow();}busy=false;},"
+        "Math.min(ms,120));}"
+        "function follow(){halt();st.textContent='live';liveTimer=setInterval(()=>goto(1e9),5000);}"
+        f"{'follow();' if live else ''}</script>"
     )
 
     rowsd = decisions(match_name, game_index)
@@ -529,7 +544,7 @@ def game_page(base, at=None):
         f"<h2>victory points over the game</h2>{vp_chart(marks, series)}"
         f"<h2>decisions</h2>{timeline or '<div class=muted>no decisions logged yet</div>'}</div></div>"
     )
-    return PAGE.format(title=base, body=body, refresh=REFRESH if live else "")
+    return PAGE.format(title=base, body=body, refresh="")  # JS follows live, no reload
 
 
 def frame(base, at):
@@ -541,10 +556,13 @@ def frame(base, at):
         gap = (times[at] - times[at - 1]) * 1000
     rows = seat_html(seat_rows(game, specs))
     action = last_action(base, at)
+    at = min(at, n)
     return {
         "svg": board_svg(game, action),
         "seats": rows,
         "gap_ms": gap,
+        "at": at,
+        "n": n,
         "meta": f"turn {game.state.num_turns} · move {at} / {n}"
         + (f" · {action.color.value} {action.action_type.value}" if action else ""),
     }
