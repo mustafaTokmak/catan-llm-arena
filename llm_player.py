@@ -11,6 +11,7 @@ import json
 import os
 import random
 import re
+import sys
 
 import httpx
 
@@ -75,10 +76,23 @@ class LLMPlayer(Player):
         if len(actions) == 1:  # forced move (roll, end turn): skip the API
             return actions[0]
         try:
-            return actions[self._ask(game, actions)]
+            action = actions[self._ask(game, actions)]
+            value = "" if action.value is None else f" {action.value}"
+            print(  # live progress: tail -f the log to watch the game
+                f"[{self.model}] {action.action_type.value}{value} "
+                f"(${self.cost_usd:.4f} total) {self.last_reason[:70]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return action
         except Exception as exc:
             self.fallbacks += 1
             self.last_error = repr(exc)[:200]
+            print(
+                f"[{self.model}] FALLBACK random ({self.last_error[:80]})",
+                file=sys.stderr,
+                flush=True,
+            )
             return random.choice(actions)
 
     def _ask(self, game, actions):
