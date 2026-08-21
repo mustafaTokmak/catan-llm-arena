@@ -60,6 +60,9 @@ _blobs = {}  # path -> (stat key, blob): playback would otherwise unpickle per f
 
 def snapshot(base):
     """The recorded game, re-read only when the match writes a new snapshot."""
+    # base reaches pickle.load, so it must never be a caller-chosen path
+    if base != os.path.basename(base) or not re.fullmatch(r"[\w.-]+", base):
+        raise ValueError(f"not a match name: {base!r}")
     path = base + ".pkl"
     st = os.stat(path)
     key = (st.st_mtime_ns, st.st_size)
@@ -1285,8 +1288,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
                 return
             if url.path == "/raw":
-                name = os.path.basename(parse_qs(url.query)["f"][0])  # no path traversal
-                if not os.path.exists(name):
+                # basename alone is not enough: it still serves .env or source from
+                # this directory, and follows a symlink straight out of it.
+                name = os.path.basename(parse_qs(url.query)["f"][0])
+                allowed = name.endswith((".jsonl", ".out"))
+                here = os.path.realpath(os.getcwd())
+                inside = os.path.realpath(name).startswith(here + os.sep)
+                if not (allowed and inside and os.path.isfile(name)):
                     self.send_error(404, "no such record")
                     return
                 with open(name, "rb") as f:
