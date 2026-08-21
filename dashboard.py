@@ -8,6 +8,7 @@ running match: state is replayed from the move log, exactly. Pages refresh
 themselves every 5 seconds. Stdlib only.
 """
 
+import collections
 import glob
 import html
 import json
@@ -655,8 +656,24 @@ font:400 11px "IBM Plex Mono",monospace;color:var(--dim)}
 .lg b{color:var(--text);font-weight:500;margin-left:3px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 
+h3{font:600 11px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.13em;
+color:var(--faint);margin:20px 0 9px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:18px}
+.stat{border-left:2px solid var(--line2);padding-left:14px}
+.stat b{display:block;font:600 25px/1.2 Fraunces,Georgia,serif;color:var(--gold);
+letter-spacing:-.01em}
+.stat span{display:block;font-size:12px;color:var(--dim);margin-top:2px}
+.barset{margin-bottom:6px}
+.bar{display:flex;align-items:center;gap:11px;margin:0 0 6px}
+.barname{width:150px;font-size:13px;flex:none}
+.bartrack{flex:1;height:7px;border-radius:4px;background:#24231a;overflow:hidden}
+.bartrack i{display:block;height:100%;border-radius:4px;
+background:linear-gradient(90deg,#6b5f2c,var(--gold))}
+.barval{width:74px;text-align:right;flex:none;
+font:500 11.5px "IBM Plex Mono",monospace;color:var(--dim);font-variant-numeric:tabular-nums}
 table{border-collapse:collapse;width:100%}
 td,th{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);font-size:13.5px}
+td:first-child,td.mono,td.spend{white-space:nowrap}
 th{font:500 10px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.14em;color:var(--faint)}
 tbody tr:hover td,table tr:hover td{background:#1c1b13}
 
@@ -678,6 +695,250 @@ def page(title, body, refresh=""):
         f"{refresh}<title>{html.escape(title)}</title>{FONTS}"
         f"<style>{CSS}</style></head><body>{body}</body></html>"
     )
+
+
+def z_for(tests):
+    """Testing N models against chance is N tests. Bonferroni: alpha/N."""
+    alpha, lo, hi = 0.05 / max(tests, 1), 0.0, 6.0
+    for _ in range(60):  # invert the normal CDF by bisection; no scipy in stdlib
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if math.erfc(mid / math.sqrt(2)) > alpha else (lo, mid)
+    return (lo + hi) / 2
+
+
+def wilson(wins, games, z):
+    if not games:
+        return 0.0, 0.0
+    p, d = wins / games, 1 + z * z / games
+    centre = (p + z * z / (2 * games)) / d
+    half = z * math.sqrt(p * (1 - p) / games + z * z / (4 * games * games)) / d
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def classify(error):
+    """Group a retry's error into something countable."""
+    if "no response within" in error:
+        return "timed out on our deadline"
+    if "no action JSON" in error:
+        return "unparseable reply"
+    if "out of range" in error:
+        return "action index out of range"
+    if "HTTPStatusError" in error:
+        code = re.search(r"(\d{3})", error)
+        return f"HTTP {code.group(1)}" if code else "HTTP error"
+    return (error.split("(")[0].strip() or "unknown").replace("Error", " error").lower()
+
+
+def run_stats():
+    """Everything the finished games can tell us, aggregated by model."""
+    blank = lambda: {
+        "wins": 0, "games": 0, "calls": 0, "fails": 0, "sec": [],
+        "tin": 0, "tout": 0, "cost": 0.0, "attempts": 0,
+    }
+    models, fails, depth, seats = collections.defaultdict(blank), Counter(), Counter(), Counter()
+    turns, moves, stamps, games = [], [], [], []
+    for results in sorted(glob.glob("*_results.jsonl")):
+        base = results[: -len("_results.jsonl")]
+        for row in read_jsonl(results):
+            game_base = f"{base}_g{row.get('game')}"
+            lineup = [short(s) for s in header_of(game_base)]
+            for slot, model in enumerate(lineup):
+                models[model]["games"] += 1
+                seats[(model, slot)] += 1
+            winner = short(re.sub(r"\s*\([A-Z]+\)$", "", row.get("winner", "")))
+            if winner in models:
+                models[winner]["wins"] += 1
+            turns.append(row.get("turns", 0))
+            games.append((game_base, row.get("turns", 0), winner))
+    for path in sorted(glob.glob("*_decisions.jsonl")):
+        for row in read_jsonl(path):
+            model = short(row.get("model", "?"))
+            slot = models[model]
+            if row.get("type") == "retry":
+                slot["fails"] += 1
+                fails[classify(str(row.get("error", "")))] += 1
+                depth[row.get("attempt", 0)] += 1
+                continue
+            slot["calls"] += 1
+            slot["sec"].append(row.get("seconds") or 0)
+            slot["tin"] += row.get("tokens_in") or 0
+            slot["tout"] += row.get("tokens_out") or 0
+            slot["cost"] += row.get("cost_usd") or 0
+            slot["attempts"] += row.get("attempts") or 1
+    for path in sorted(glob.glob("*_g*.jsonl")):
+        rows = [r for r in read_jsonl(path) if "i" in r]
+        if rows:
+            moves.append(len(rows))
+            stamps.append((rows[0].get("t") or 0, rows[-1].get("t") or 0))
+    return {
+        "models": models, "fails": fails, "depth": depth, "seats": seats,
+        "turns": turns, "moves": moves, "stamps": stamps, "games": games,
+    }
+
+
+def header_of(base):
+    """The lineup a game was played with, from its move log header."""
+    rows = read_jsonl(base + ".jsonl")
+    return rows[0].get("players", []) if rows and "players" in rows[0] else []
+
+
+def pct(part, whole):
+    return f"{100 * part / whole:.0f}%" if whole else "-"
+
+
+def bars(models, key, label, unit="s", fmt="{:.1f}"):
+    """One horizontal bar per model — enough to see the shape without a chart library."""
+    top = max((key(d) for d in models.values()), default=0) or 1
+    out = []
+    for name, d in sorted(models.items(), key=lambda kv: -key(kv[1])):
+        value = key(d)
+        out.append(
+            f"<div class=bar><span class=barname>{name}</span>"
+            f"<span class=bartrack><i style='width:{100 * value / top:.1f}%'></i></span>"
+            f"<span class=barval>{fmt.format(value)}{unit}</span></div>"
+        )
+    return f"<div class=barset><h3>{label}</h3>{''.join(out)}</div>"
+
+
+def stats_page():
+    s = run_stats()
+    models = s["models"]
+    if not models:
+        return page("arena stats", "<div class=page><h1>no finished games yet</h1></div>")
+    played = [d for d in models.values() if d["games"]]
+    n_games = max((d["games"] for d in played), default=0)
+    z = z_for(len(played))
+    seats_n = max((len(header_of(g[0])) for g in s["games"]), default=4)
+    chance = 1 / max(seats_n, 2)
+    calls = sum(d["calls"] for d in models.values())
+    failed = sum(d["fails"] for d in models.values())
+    cost = sum(d["cost"] for d in models.values())
+    tin = sum(d["tin"] for d in models.values())
+    tout = sum(d["tout"] for d in models.values())
+    hours = (
+        (max(e for _, e in s["stamps"]) - min(b for b, _ in s["stamps"])) / 3600
+        if s["stamps"] else 0
+    )
+
+    head = "".join(
+        f"<div class=stat><b>{v}</b><span>{k}</span></div>"
+        for k, v in [
+            ("games", len(s["turns"])),
+            ("decisions put to a model", f"{calls:,}"),
+            ("moves played", f"{sum(s['moves']):,}"),
+            ("tokens", f"{(tin + tout) / 1e6:.2f}M"),
+            ("logged cost", f"${cost:.2f}"),
+            ("wall clock", f"{hours:.1f}h"),
+        ]
+    )
+
+    rank = sorted(models.items(), key=lambda kv: -kv[1]["wins"] / max(kv[1]["games"], 1))
+    standing = []
+    for name, d in rank:
+        lo, hi = wilson(d["wins"], d["games"], z)
+        lat = sorted(d["sec"]) or [0]
+        p90 = lat[min(int(len(lat) * 0.9), len(lat) - 1)]
+        total = d["calls"] + d["fails"]
+        standing.append(
+            f"<tr><td><b>{name}</b></td>"
+            f"<td class=mono><b>{d['wins']}</b>/{d['games']}</td>"
+            f"<td class=mono>{pct(d['wins'], d['games'])}</td>"
+            f"<td class='mono sub'>{100 * lo:.1f}&ndash;{100 * hi:.1f}%"
+            + ("<b> clears</b>" if lo > chance else "")
+            + f"</td><td class=mono>{statistics.median(lat):.1f}s</td>"
+            f"<td class='mono sub'>{p90:.1f}s</td>"
+            f"<td class='mono sub'>{max(lat):.0f}s</td>"
+            f"<td class=mono>{d['fails']:,}</td>"
+            f"<td class='mono sub'>{pct(d['fails'], total)}</td>"
+            f"<td class='mono sub'>{d['tout'] / max(d['calls'], 1):.0f}</td>"
+            f"<td class='mono spend'>${d['cost']:.2f}</td></tr>"
+        )
+
+    failure_rows = "".join(
+        f"<tr><td>{html.escape(kind)}</td><td class=mono>{n:,}</td>"
+        f"<td class='mono sub'>{pct(n, failed)}</td></tr>"
+        for kind, n in s["fails"].most_common()
+    ) or "<tr><td colspan=3 class=sub>no failures recorded</td></tr>"
+
+    deepest = max(s["depth"], default=0)
+    depth_rows = "".join(
+        f"<tr><td class=mono>attempt {a}</td><td class=mono>{s['depth'][a]:,}</td></tr>"
+        for a in sorted(s["depth"])[:8]
+    )
+
+    seat_rows_html = ""
+    if s["seats"]:
+        slots = range(max(k[1] for k in s["seats"]) + 1)
+        seat_rows_html = (
+            "<tr><th>model</th>"
+            + "".join(f"<th>seat {i + 1}</th>" for i in slots)
+            + "</tr>"
+            + "".join(
+                f"<tr><td>{m}</td>"
+                + "".join(f"<td class=mono>{s['seats'][(m, i)]}</td>" for i in slots)
+                + "</tr>"
+                for m in sorted(models)
+                if models[m]["games"]
+            )
+        )
+
+    records = "".join(
+        f"<tr><td><a href='/game?base={html.escape(base)}'>{html.escape(base)}</a></td>"
+        f"<td class=mono>{turns}</td><td>{html.escape(winner or '-')}</td>"
+        f"<td class=sub><a href='/raw?f={base}.jsonl'>moves</a> &middot; "
+        f"<a href='/raw?f={base.rsplit('_g', 1)[0]}_decisions.jsonl'>decisions</a> &middot; "
+        f"<a href='/raw?f={base.rsplit('_g', 1)[0]}.out'>log</a></td></tr>"
+        for base, turns, winner in s["games"]
+    )
+
+    turns_sorted = sorted(s["turns"]) or [0]
+    body = (
+        "<div class=topbar><span class=home><a href='/'>&larr; arena</a></span>"
+        f"<h1>results <span class=sub>{len(s['turns'])} games</span></h1>"
+        f"<span class='meta mono'>{calls:,} decisions &middot; {failed:,} failed attempts "
+        f"&middot; ${cost:.2f}</span></div>"
+        f"<div class='page fresh'><div class=stack>"
+        f"<div class='card rise'><div class=grid>{head}</div></div>"
+        "<div class='card rise'><h2>standings</h2><table>"
+        "<tr><th>model</th><th>wins</th><th>rate</th>"
+        f"<th>interval (adj. {len(played)} models)</th><th>median</th><th>p90</th>"
+        "<th>slowest</th><th>failed</th><th>rate</th><th>out/call</th><th>cost</th></tr>"
+        f"{''.join(standing)}</table>"
+        f"<div class=sub>Chance is {100 * chance:.0f}% with {seats_n} seats. Intervals are "
+        "Bonferroni-adjusted &mdash; testing every model against chance is several tests, and "
+        "an unadjusted 95% interval crowns a winner about one run in four by luck alone.</div>"
+        "</div>"
+        "<div class='card rise'><h2>per model</h2>"
+        + bars(models, lambda d: statistics.median(sorted(d["sec"]) or [0]), "median seconds per decision")
+        + bars(models, lambda d: 100 * d["fails"] / max(d["calls"] + d["fails"], 1), "failed attempts", "%", "{:.0f}")
+        + bars(models, lambda d: d["tout"] / max(d["calls"], 1), "output tokens per decision", "", "{:.0f}")
+        + bars(models, lambda d: d["cost"], "cost", "", "${:.2f}")
+        + "</div>"
+        f"<div class='card rise'><h2>failures</h2>"
+        f"<div class=sub>{failed:,} failed attempts against {calls:,} successful decisions. "
+        "Every one was retried until the model answered &mdash; no move was ever substituted.</div>"
+        f"<table><tr><th>failure</th><th>count</th><th>share</th></tr>{failure_rows}</table>"
+        f"<h3>retry depth</h3><div class=sub>deepest chain: {deepest} attempts</div>"
+        f"<table>{depth_rows}</table></div>"
+        + (
+            f"<div class='card rise'><h2>seat balance</h2><div class=sub>Turn order is worth real "
+            "points, so seats rotate per match. These should be even.</div>"
+            f"<table>{seat_rows_html}</table></div>"
+            if seat_rows_html
+            else ""
+        )
+        + f"<div class='card rise'><h2>game length</h2><div class=sub>median "
+        f"{turns_sorted[len(turns_sorted) // 2]} turns, range {min(turns_sorted)}&ndash;"
+        f"{max(turns_sorted)}; median {sorted(s['moves'])[len(s['moves']) // 2] if s['moves'] else 0} "
+        f"moves. Only {pct(calls, sum(s['moves']))} of moves went to a model &mdash; forced moves "
+        "with a single legal action skip the API.</div></div>"
+        "<div class='card rise'><h2>every record</h2>"
+        "<div class=sub>Each game replays move by move from its own log. Raw files are served "
+        "as text.</div><table><tr><th>game</th><th>turns</th><th>winner</th><th>raw</th></tr>"
+        f"{records}</table></div>"
+        "</div></div>"
+    )
+    return page("arena results", body)
 
 
 def index_page():
@@ -1023,10 +1284,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
+            if url.path == "/raw":
+                name = os.path.basename(parse_qs(url.query)["f"][0])  # no path traversal
+                if not os.path.exists(name):
+                    self.send_error(404, "no such record")
+                    return
+                with open(name, "rb") as f:
+                    blob = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+                return
             if url.path == "/game":
                 query = parse_qs(url.query)
                 at = query.get("at")
                 rendered = game_page(query["base"][0], at=int(at[0]) if at else None)
+            elif url.path == "/stats":
+                rendered = stats_page()
             else:
                 rendered = index_page()
         except Exception as exc:  # snapshot mid-write, bad param: stay up
