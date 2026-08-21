@@ -198,7 +198,7 @@ def main():
 
 
 def wilson(wins, games, z=1.959964):
-    """95% interval on a win rate. A bare percentage from 30 games means nothing."""
+    """Interval on a win rate. A bare percentage from a few dozen games means nothing."""
     if not games:
         return 0.0, 0.0
     p, d = wins / games, 1 + z * z / games
@@ -207,9 +207,25 @@ def wilson(wins, games, z=1.959964):
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+def z_for(models):
+    """Comparing N models against chance is N tests; tighten the threshold or
+
+    every fourth run produces a spurious 'winner'. Bonferroni: alpha/N.
+    """
+    alpha = 0.05 / max(models, 1)
+    lo, hi = 0.0, 6.0
+    for _ in range(60):  # invert the normal CDF by bisection: no scipy needed
+        mid = (lo + hi) / 2
+        if math.erfc(mid / math.sqrt(2)) > alpha:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
 def standings(directory):
     """Wins per model with intervals — seat rotation means colours must be ignored."""
-    wins, games = Counter(), Counter()
+    wins, games, seats = Counter(), Counter(), 0
     for results in sorted(glob.glob(os.path.join(directory, "*_results.jsonl"))):
         base = results[: -len("_results.jsonl")]
         with open(results, errors="replace") as f:
@@ -218,7 +234,9 @@ def standings(directory):
                     row = json.loads(line)
                 except ValueError:
                     continue
-                for model in lineup_of(f"{base}_g{row.get('game')}"):
+                lineup = lineup_of(f"{base}_g{row.get('game')}")
+                seats = max(seats, len(lineup))
+                for model in lineup:
                     games[model] += 1
                 # "llm:openai/gpt-5.6-luna (ORANGE)" -> the model, whatever seat it drew
                 winner = re.sub(r"\s*\([A-Z]+\)$", "", row.get("winner", ""))
@@ -227,16 +245,20 @@ def standings(directory):
     if not games:
         print("\nno finished games yet")
         return
-    print(f"\n{'model':<26}{'wins':>6}{'games':>7}{'rate':>8}   95% interval")
+    z = z_for(len(games))
+    chance = 1 / max(seats, 2)
+    print(f"\n{'model':<26}{'wins':>6}{'games':>7}{'rate':>8}   interval (adjusted for {len(games)} models)")
     for model in sorted(games, key=lambda m: -wins[m] / max(games[m], 1)):
-        lo, hi = wilson(wins[model], games[model])
-        beats = "  beats chance" if lo > 0.25 else ""
+        lo, hi = wilson(wins[model], games[model], z)
         print(
             f"  {model:<24}{wins[model]:>6}{games[model]:>7}"
             f"{100 * wins[model] / games[model]:>7.0f}%   "
-            f"{100 * lo:4.1f}% - {100 * hi:4.1f}%{beats}"
+            f"{100 * lo:4.1f}% - {100 * hi:4.1f}%"
+            + ("   clears chance" if lo > chance else "")
         )
-    print("  (chance is 25% in a four-player game)")
+    print(f"  chance is {100 * chance:.0f}% with {max(seats, 2)} seats. Intervals are Bonferroni-adjusted:")
+    print("  testing every model against chance is several tests, and an unadjusted")
+    print("  95% interval will crown a winner roughly one run in four by luck alone.")
 
 
 def strip(spec):

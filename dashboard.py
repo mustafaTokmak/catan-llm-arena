@@ -1077,6 +1077,16 @@ if __name__ == "__main__":
     port = int(args[0]) if args and args[0].isdigit() else 8765
     where = next((a for a in args if not a.isdigit()), None)
     if where:  # match files live wherever the batch wrote them
-        os.chdir(where)
-    print(f"arena dashboard: http://localhost:{port}  (watching {os.getcwd()})")
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+        try:
+            os.chdir(where)
+        except OSError as exc:
+            raise SystemExit(f"can't watch {where!r}: {exc}\nrun the batch first, or pass its --dir")
+    try:
+        server = HTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:  # blank browser tab otherwise: nothing explains itself
+        raise SystemExit(
+            f"port {port} is not available ({exc}).\n"
+            f"something else is already serving it — `lsof -nP -iTCP:{port} -sTCP:LISTEN`"
+        )
+    print(f"arena dashboard: http://localhost:{port}  (watching {os.getcwd()})", flush=True)
+    server.serve_forever()
