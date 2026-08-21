@@ -735,7 +735,7 @@ def classify(error):
 def run_stats():
     """Everything the finished games can tell us, aggregated by model."""
     blank = lambda: {
-        "wins": 0, "games": 0, "calls": 0, "fails": 0, "sec": [],
+        "wins": 0, "games": 0, "calls": 0, "fails": 0, "sec": [], "lat": [],
         "tin": 0, "tout": 0, "cost": 0.0, "attempts": 0,
     }
     models, fails, depth, seats = collections.defaultdict(blank), Counter(), Counter(), Counter()
@@ -764,9 +764,14 @@ def run_stats():
                 continue
             slot["calls"] += 1
             slot["sec"].append(row.get("seconds") or 0)
+            if row.get("latency") is not None:  # absent in logs written before the fix
+                slot["lat"].append(row["latency"])
             slot["tin"] += row.get("tokens_in") or 0
             slot["tout"] += row.get("tokens_out") or 0
-            slot["cost"] += row.get("cost_usd") or 0
+            if "cost_total" in row:  # per-move delta; older logs logged the running total
+                slot["cost"] += row.get("cost_usd") or 0
+            else:
+                slot["cost"] = max(slot["cost"], row.get("cost_usd") or 0)
             slot["attempts"] += row.get("attempts") or 1
     for path in sorted(glob.glob("*_g*.jsonl")):
         rows = [r for r in read_jsonl(path) if "i" in r]
@@ -835,11 +840,14 @@ def stats_page():
         ]
     )
 
+    # "seconds" is the whole decision including retries; "latency" is the answering
+    # call alone. Old logs have only the first, and it overstates a flaky model 2.6x.
+    timed = all(len(d["lat"]) == d["calls"] for d in played)
     rank = sorted(models.items(), key=lambda kv: -kv[1]["wins"] / max(kv[1]["games"], 1))
     standing = []
     for name, d in rank:
         lo, hi = wilson(d["wins"], d["games"], z)
-        lat = sorted(d["sec"]) or [0]
+        lat = sorted(d["lat"] if timed else d["sec"]) or [0]
         p90 = lat[min(int(len(lat) * 0.9), len(lat) - 1)]
         total = d["calls"] + d["fails"]
         standing.append(
@@ -863,7 +871,7 @@ def stats_page():
         for kind, n in s["fails"].most_common()
     ) or "<tr><td colspan=3 class=sub>no failures recorded</td></tr>"
 
-    deepest = max(s["depth"], default=0)
+    deepest = max(s["depth"], default=0) + 1  # rows count failures; +1 for the answer
     depth_rows = "".join(
         f"<tr><td class=mono>attempt {a}</td><td class=mono>{s['depth'][a]:,}</td></tr>"
         for a in sorted(s["depth"])[:8]
@@ -909,10 +917,18 @@ def stats_page():
         f"{''.join(standing)}</table>"
         f"<div class=sub>Chance is {100 * chance:.0f}% with {seats_n} seats. Intervals are "
         "Bonferroni-adjusted &mdash; testing every model against chance is several tests, and "
-        "an unadjusted 95% interval crowns a winner about one run in four by luck alone.</div>"
-        "</div>"
+        "an unadjusted 95% interval crowns a winner about one run in four by luck alone."
+        + (
+            ""
+            if timed
+            else " <b>Timings here are whole-decision wall clock including retries and "
+            "backoff, not model latency</b> &mdash; these logs predate the split, so a "
+            "model that retried often reads far slower than it is."
+        )
+        + "</div></div>"
         "<div class='card rise'><h2>per model</h2>"
-        + bars(models, lambda d: statistics.median(sorted(d["sec"]) or [0]), "median seconds per decision")
+        + bars(models, lambda d: statistics.median(sorted(d["lat"] if timed else d["sec"]) or [0]),
+        "median seconds per " + ("model call" if timed else "decision, retries included"))
         + bars(models, lambda d: 100 * d["fails"] / max(d["calls"] + d["fails"], 1), "failed attempts", "%", "{:.0f}")
         + bars(models, lambda d: d["tout"] / max(d["calls"], 1), "output tokens per decision", "", "{:.0f}")
         + bars(models, lambda d: d["cost"], "cost", "", "${:.2f}")
@@ -931,8 +947,8 @@ def stats_page():
             else ""
         )
         + f"<div class='card rise'><h2>game length</h2><div class=sub>median "
-        f"{turns_sorted[len(turns_sorted) // 2]} turns, range {min(turns_sorted)}&ndash;"
-        f"{max(turns_sorted)}; median {sorted(s['moves'])[len(s['moves']) // 2] if s['moves'] else 0} "
+        f"{statistics.median(turns_sorted):.0f} turns, range {min(turns_sorted)}&ndash;"
+        f"{max(turns_sorted)}; median {statistics.median(s['moves']) if s['moves'] else 0:.0f} "
         f"moves. Only {pct(calls, sum(s['moves']))} of moves went to a model &mdash; forced moves "
         "with a single legal action skip the API.</div></div>"
         "<div class='card rise'><h2>every record</h2>"
@@ -1029,8 +1045,9 @@ def leaderboard():
                 for model in seats_of(f"{match_name}_g{row.get('game')}"):
                     games[model] += 1
                 winner = row.get("winner", "")
-                for spec in set(re.findall(r"llm:[\w./-]+", winner)):
-                    wins[spec.removeprefix("llm:")] += 1
+                name = re.sub(r"\s*\([A-Z]+\)$", "", winner).strip()
+                if name.startswith("llm:"):
+                    wins[name.removeprefix("llm:")] += 1
     stats = {}
     for path in sorted(glob.glob("*_decisions.jsonl")):
         with open(path, errors="replace") as f:

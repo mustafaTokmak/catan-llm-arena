@@ -67,9 +67,12 @@ resumable process, and reports win rates with confidence intervals:
 .venv/bin/python dashboard.py 8765 runs
 ```
 
-Seats rotate per match (match `i` starts the lineup at `i % 4`), so over any
-multiple of four each model plays each turn position equally often — turn order
-is worth real points in Catan and would otherwise ride along with model identity.
+Seats rotate per match (match `i` starts the lineup at `i % 4`), so each model
+takes each colour equally often. This does **not** balance turn order: the
+engine shuffles play order itself at game start, so first position is random
+per game rather than evenly dealt. Turn order is worth real points in Catan
+(first position won 36% of a measured 50-game run), so check the seat table on
+`/stats` before reading much into a small run.
 A crashed match restarts with `--resume`; a fatal setup error stops that match
 alone and is reported at the end. Rerun the same command to resume the batch.
 

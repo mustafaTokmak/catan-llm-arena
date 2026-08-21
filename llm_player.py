@@ -150,9 +150,11 @@ class LLMPlayer(Player):
         for attempt in itertools.count():  # every move is the model's own
             # cap the exponent: 1.6**1511 overflows, and the deadline is capped anyway
             deadline = min(self.deadline * 1.6 ** min(attempt, 12), self.max_deadline)
+            asked = time.time()
             try:
                 index = self._ask(game, actions, deadline)
                 action = actions[index]
+                latency = time.time() - asked  # this call only, not the retries
             except FatalSetupError:
                 raise
             except Exception as exc:
@@ -197,7 +199,12 @@ class LLMPlayer(Player):
                     "reason": self.last_reason,
                     "chose": index,
                     "options": len(actions),
+                    # seconds is wall clock for the whole decision (retries and
+                    # backoff included); latency is how long the model that
+                    # answered actually took. Reporting the first as latency
+                    # inflates a retry-heavy model by ~2.6x.
                     "seconds": round(seconds, 1),
+                    "latency": round(latency, 1),
                     "attempts": attempt + 1,
                     "schema": self.use_schema,
                     "tokens_in": self.input_tokens - before[0],
@@ -288,7 +295,11 @@ class LLMPlayer(Player):
         if choice is None:
             raise ValueError(f"no action JSON in reply: {(message.get('content') or '')[:120]!r}")
         self.last_reason = str(choice.get("reason", ""))
-        index = int(choice["action_index"])
+        index = choice["action_index"]
+        # int() would turn 1.9 into 1 and True into 1 — a move the model never
+        # picked. A malformed answer is a failed attempt, so retry instead.
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError(f"action_index is not an integer: {index!r}")
         if not 0 <= index < len(actions):
             raise ValueError(f"action_index {index} out of range")
         return index

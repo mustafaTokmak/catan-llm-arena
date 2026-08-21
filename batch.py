@@ -6,10 +6,12 @@ matches never touch each other's state. A match that dies is restarted with
 fatal setup error — bad key, no credit, malformed request — stops for good
 and is reported, because retrying it would just burn the same error 50 times.
 
-Seats rotate: match i starts the lineup at i % seats, so over any multiple of
-four matches each model sits in each turn position equally often. Turn order
-is worth real points in Catan, and without rotation it rides along with model
-identity into the win rate.
+Seats rotate: match i starts the lineup at i % seats, so each model takes each
+COLOUR equally often. Note what this does not do: catanatron re-randomises who
+plays first at Game construction (state.py, random.sample), so turn order is
+already random per game and this rotation does not control it. Turn order is
+worth real points in Catan — first position won 36% of a measured 50-game run —
+so it is randomised, not balanced, and small runs can still deal it unevenly.
 
     python batch.py --matches 50 --dir runs
     python batch.py --matches 50 --dry-run          # free bots, no API calls
@@ -39,7 +41,10 @@ FATAL = 3  # arena.py's exit code for "do not retry"
 
 
 def rotate(players, by):
-    """Cycle the lineup so each model takes each turn position equally often."""
+    """Cycle the lineup so each model takes each colour equally often.
+
+    This does NOT balance turn order: the engine shuffles play order itself.
+    """
     seats = players.split(",")
     at = by % len(seats)
     return ",".join(seats[at:] + seats[:at])
