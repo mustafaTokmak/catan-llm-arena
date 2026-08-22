@@ -668,7 +668,7 @@ font:400 11px "IBM Plex Mono",monospace;color:var(--dim)}
 h3{font:600 11px Oswald;text-transform:uppercase;letter-spacing:.13em;
 color:var(--faint);margin:20px 0 9px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:18px}
-.stat{border-left:2px solid var(--line2);padding-left:14px}
+.stat{border-top:2px solid var(--line2);padding-top:12px}
 .stat b{display:block;font:600 25px/1.2 Oswald,sans-serif;color:var(--gold);
 letter-spacing:-.01em}
 .stat span{display:block;font-size:12px;color:var(--dim);margin-top:2px}

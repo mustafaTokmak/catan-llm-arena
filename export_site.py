@@ -43,28 +43,28 @@ REPO = "https://github.com/mustafaTokmak/catan-llm-arena"
 
 INTRO = """<div class='card rise'>
 <h2>what this is</h2>
-<p class=sub style='font-size:15px;line-height:1.6;max-width:70ch'>
-Four language models played 50 four-player games of Settlers of Catan against each other
-&mdash; no scripted bots, no humans, no judges. Every move was chosen by the model whose
-seat it was: a failed API call is retried until the model answers, never replaced by a
-random move. <b>23,911 moves, 9,484 model decisions, 3.3 hours, $5.54.</b>
+<p class=sub style='font-size:16px;line-height:1.62;max-width:64ch'>
+Four language models played 50 games of Catan against each other. No bots, no humans,
+no judges &mdash; every move chosen by the model whose seat it was, retried until it
+answered, never replaced by a random one.
 </p>
-<p class=sub style='font-size:15px;line-height:1.6;max-width:70ch'>
-<b>What the run supports:</b> the four models did not win equally often (p&nbsp;&asymp;&nbsp;0.003),
-and DeepSeek and Luna together took 38 of 50 games (p&nbsp;=&nbsp;0.0003).
-<b>What it does not:</b> no single model clears the 25% chance line once you correct for
-testing four of them, and 19&ndash;19 between the leaders is 50 games failing to separate them.
+<div class=grid style='margin:20px 0 4px'>
+  <div class=stat><b>50</b><span>games</span></div>
+  <div class=stat><b>23,911</b><span>moves</span></div>
+  <div class=stat><b>9,484</b><span>model decisions</span></div>
+  <div class=stat><b>$5.54</b><span>total spend</span></div>
+</div>
+<p class=sub style='font-size:16px;line-height:1.62;max-width:64ch;margin-top:20px'>
+DeepSeek and Luna took 38 of 50 games (p&nbsp;=&nbsp;0.0003). But no single model beats
+chance once you correct for testing four of them, and 19&ndash;19 does not separate the leaders.
 </p>
-<p class=sub style='font-size:15px;line-height:1.6;max-width:70ch'>
-<b>The caveat that matters most:</b> this version of the prompt sent no board &mdash; no tiles,
-no dice numbers, no adjacency &mdash; only a numbered list of legal moves. Catanatron numbers
-nodes 0&ndash;23 as exactly the 24 interior three-tile intersections and lists actions in node
-order, so &ldquo;prefer the top of the list&rdquo; is a decent opening heuristic on its own.
-Read the ranking with that in mind.
+<p class=sub style='font-size:16px;line-height:1.62;max-width:64ch'>
+<b>The catch:</b> they never saw the board &mdash; only a numbered list of legal moves, and
+the engine happens to list the best spots first. Read the ranking with that in mind.
 </p>
-<p class=sub style='font-size:15px;line-height:1.6'>
+<p class=sub style='font-size:15px'>
 <a href='/stats.html'>full statistics</a> &middot;
-<a href='https://github.com/mustafaTokmak/catan-llm-arena'>source and the review that found three of my mistakes</a>
+<a href='https://github.com/mustafaTokmak/catan-llm-arena'>source, and the review that found three of my mistakes</a>
 </p>
 </div>"""
 
