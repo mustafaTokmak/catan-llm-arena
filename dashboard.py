@@ -143,22 +143,22 @@ def vp_chart(turns, series, labels, width=560, height=196):
         y, win = sy(vp), vp == 10
         out.append(
             f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" '
-            f'stroke="{"#6b6a52" if win else "#26251d"}"'
+            f'stroke="{"#5b636d" if win else "#2b3038"}"'
             + (' stroke-dasharray="4 5"' if win else "")
             + "/>"
         )
         out.append(
             f'<text x="{left - 8}" y="{y:.1f}" text-anchor="end" dominant-baseline="central" '
-            f'{tick} fill="{"#c9c079" if win else "#6d6a5c"}">{vp}</text>'
+            f'{tick} fill="{"#ffd23f" if win else "#9aa3ad"}">{vp}</text>'
         )
     out.append(
-        f'<text x="{right}" y="{sy(10) - 7:.1f}" text-anchor="end" {tick} fill="#c9c079" '
+        f'<text x="{right}" y="{sy(10) - 7:.1f}" text-anchor="end" {tick} fill="#ffd23f" '
         'opacity=".8">WIN</text>'
     )
     for t in (0, turns[-1]):
         out.append(
             f'<text x="{sx(t):.1f}" y="{foot + 16:.1f}" text-anchor="middle" '
-            f'{tick} fill="#6d6a5c">turn {t}</text>'
+            f'{tick} fill="#9aa3ad">turn {t}</text>'
         )
     legend = []
     for slot, (color, values) in enumerate(series.items()):
@@ -178,7 +178,7 @@ def vp_chart(turns, series, labels, width=560, height=196):
         ex, ey = sx(turns[-1]), sy(values[-1]) + offset
         out.append(
             f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="3.2" fill="{SEAT_FILL[color]}" '
-            'stroke="#100f0a" stroke-width="1.5"/>'
+            'stroke="#14161a" stroke-width="1.5"/>'
         )
         out.append(
             f'<text x="{ex + 8:.1f}" y="{ey:.1f}" dominant-baseline="central" '
@@ -351,7 +351,7 @@ def board_svg(game, last_action=None):
         if spot:
             out.append(
                 f'<circle class="lastring" cx="{spot[0]:.1f}" cy="{spot[1]:.1f}" r="20" '
-                'fill="none" stroke="#e8c96a" stroke-width="3" opacity="0.95"/>'
+                'fill="none" stroke="#ffd23f" stroke-width="3" opacity="0.95"/>'
             )
     out.append("</svg>")
     return "".join(out)
@@ -404,41 +404,56 @@ def seat_rows(game, specs):
 
 def race_svg(rows, width=600):
     """The whole standing as one picture: four tokens on the shared race to 10."""
-    tied = max(Counter(r["vp"] for r in rows).values(), default=1)
-    height = 66 + 30 * tied  # tied seats stack upward; give them room
-    left, right, base = 34, width - 34, height - 26
+    left, right = 34, width - 34
     x = lambda vp: left + (right - left) * min(vp, 10) / 10
+
+    # Seats one point apart sit close enough that their names overlap, so stack on
+    # whether the labels actually collide rather than on an exact tie in points.
+    levels, placed = [], []
+    for r in rows:
+        cx, label = x(r["vp"]), short(r["model"])
+        half = 3.3 * len(label) + 5  # ~6.6px per char at 11.5px semibold
+        anchor = "start" if cx < 62 else ("end" if cx > width - 62 else "middle")
+        x0, x1 = ((cx, cx + 2 * half) if anchor == "start"
+                  else (cx - 2 * half, cx) if anchor == "end"
+                  else (cx - half, cx + half))
+        level = 0
+        while any(lv == level and x0 < px1 + 6 and x1 > px0 - 6 for lv, px0, px1 in placed):
+            level += 1
+        placed.append((level, x0, x1))
+        levels.append((level, anchor))
+
+    height = 66 + 30 * (max((lv for lv, _ in levels), default=0) + 1)
+    base = height - 26
     out = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img">'
            "<title>race to 10 victory points</title>"]
     out.append(
-        f'<line x1="{left}" y1="{base}" x2="{right}" y2="{base}" stroke="#3b3929" stroke-width="1.5"/>'
+        f'<line x1="{left}" y1="{base}" x2="{right}" y2="{base}" stroke="#2b3038" stroke-width="1.5"/>'
     )
     for vp in range(11):
         tall = vp % 5 == 0
         out.append(
             f'<line x1="{x(vp):.1f}" y1="{base - (7 if tall else 4)}" x2="{x(vp):.1f}" '
-            f'y2="{base}" stroke="{"#6b6a52" if tall else "#33322a"}" stroke-width="1.5"/>'
+            f'y2="{base}" stroke="{"#5b636d" if tall else "#2b3038"}" stroke-width="1.5"/>'
         )
         if tall:
             out.append(
                 f'<text x="{x(vp):.1f}" y="{base + 15}" text-anchor="middle" font-size="9.5" '
                 'font-family="IBM Plex Mono,monospace" letter-spacing=".08em" '
-                f'fill="{"#c9c079" if vp == 10 else "#6d6a5c"}">{vp}</text>'
+                f'fill="{"#ffd23f" if vp == 10 else "#9aa3ad"}">{vp}</text>'
             )
-    stack = Counter()
     for rank, r in enumerate(rows):
-        vp, cx = r["vp"], x(r["vp"])
-        y = base - 14 - 30 * stack[vp]  # tied seats sit one above the other
-        stack[vp] += 1
+        cx = x(r["vp"])
+        level, anchor = levels[rank]
+        y = base - 14 - 30 * level  # colliding names sit one above the other
         fill = SEAT_FILL[r["color"]]
         if rank == 0:
             out.append(f'<circle cx="{cx:.1f}" cy="{y:.1f}" r="11" fill="{fill}" opacity=".22"/>')
         out.append(
             f'<circle cx="{cx:.1f}" cy="{y:.1f}" r="6.5" fill="{fill}" '
-            'stroke="#100f0a" stroke-width="2"/>'
+            'stroke="#14161a" stroke-width="2"/>'
         )
-        # label above the token, pinned inside the edges so names never collide
-        anchor = "start" if cx < 62 else ("end" if cx > width - 62 else "middle")
+        # label above the token, pinned inside the edges
         out.append(
             f'<text x="{cx:.1f}" y="{y - 13:.1f}" text-anchor="{anchor}" '
             'font-size="11.5" font-weight="600" letter-spacing="-.01em" '
@@ -524,31 +539,26 @@ REFRESH = '<meta http-equiv="refresh" content="5">'
 FONTS = (
     '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
     '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
-    "family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,400&"
-    "family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600"
+    "family=Oswald:wght@300;500;700&family=Barlow:wght@400;500;600&"
+    "family=IBM+Plex+Mono:wght@400;500"
     '&display=swap">'
 )
 
-# A dark table under a lamp: felt and wood for the game, mono telemetry for the
-# machines playing it. Single braces — CSS is substituted, not formatted.
+# Broadcast scoreboard: condensed caps, one gold accent, panels instead of felt.
+# Matches the LinkedIn carousel. Single braces — CSS is substituted, not formatted.
 CSS = """
 :root{
---ink:#100f0a;--card:#1b1a12;--card2:#191810;--line:#2b2a20;--line2:#3b3929;
---text:#ece7d9;--dim:#94907e;--faint:#6d6a5c;--gold:#e8c96a;--win:#8fbf5a;--warn:#d9926a;
+--ink:#14161a;--card:#1d2026;--card2:#23272e;--line:#2b3038;--line2:#3a3f47;
+--text:#f2f4f6;--dim:#9aa3ad;--faint:#5b636d;--gold:#ffd23f;--win:#ffd23f;--warn:#ff8a5c;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--ink);color:var(--text);
-font:15px/1.6 "IBM Plex Sans",-apple-system,system-ui,sans-serif;
-background-image:radial-gradient(120vh 78vh at 28% -12%,#26241a 0%,transparent 62%),
-radial-gradient(88vh 58vh at 88% -4%,#1d1f17 0%,transparent 58%);
-background-attachment:fixed}
-body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.55;
-background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.04'/%3E%3C/svg%3E")}
+font:15px/1.6 Barlow,-apple-system,system-ui,sans-serif}
 a{color:var(--gold);text-decoration:none}
 a:hover{text-decoration:underline}
-h1{font:600 25px/1.15 Fraunces,Georgia,serif;letter-spacing:-.015em;margin:0}
-h2{font:600 10px/1 "IBM Plex Sans",sans-serif;text-transform:uppercase;
-letter-spacing:.16em;color:var(--faint);margin:0 0 11px}
+h1{font:700 27px/1.1 Oswald,Barlow,sans-serif;text-transform:uppercase;letter-spacing:.005em;margin:0}
+h2{font:500 11px/1 Oswald,sans-serif;text-transform:uppercase;
+letter-spacing:.22em;color:var(--dim);margin:0 0 11px}
 .page{position:relative;z-index:1;max-width:1560px;margin:0 auto;padding:22px 26px 70px}
 .muted,.sub{color:var(--dim);font-size:13px}
 .sub{font-size:.82em;color:var(--faint);font-weight:400}
@@ -557,21 +567,20 @@ font-variant-numeric:tabular-nums}
 
 .topbar{position:sticky;top:0;z-index:20;display:flex;align-items:baseline;gap:16px;
 flex-wrap:wrap;padding:13px 26px;border-bottom:1px solid var(--line);
-background:rgba(16,15,10,.85);backdrop-filter:blur(14px)}
-.topbar .home{font:500 10px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.18em;
+background:rgba(20,22,26,.88);backdrop-filter:blur(14px)}
+.topbar .home{font:500 10px Oswald;text-transform:uppercase;letter-spacing:.18em;
 color:var(--faint)}
 .topbar .meta{margin-left:auto;font-size:12px;color:var(--dim)}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;
-border:1px solid var(--line2);font:500 11px "IBM Plex Sans";letter-spacing:.06em;
+border:1px solid var(--line2);font:500 11px Oswald;letter-spacing:.06em;
 text-transform:uppercase;color:var(--dim)}
-.pill.on{color:var(--win);border-color:#3d5a2d}
+.pill.on{color:var(--win);border-color:#6b5a12}
 .pill.on:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--win);
 animation:beat 2.4s ease-out infinite}
-@keyframes beat{0%{box-shadow:0 0 0 0 rgba(143,191,90,.45)}70%{box-shadow:0 0 0 7px rgba(143,191,90,0)}100%{box-shadow:0 0 0 0 rgba(143,191,90,0)}}
+@keyframes beat{0%{box-shadow:0 0 0 0 rgba(255,210,63,.45)}70%{box-shadow:0 0 0 7px rgba(255,210,63,0)}100%{box-shadow:0 0 0 0 rgba(255,210,63,0)}}
 
-.card{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:14px;
-background:linear-gradient(180deg,#1e1c14,var(--card2));
-box-shadow:0 20px 44px -30px #000,inset 0 1px 0 rgba(255,255,255,.045);padding:15px 17px}
+.card{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:6px;
+background:var(--card);padding:15px 17px}
 .wrap{display:grid;grid-template-columns:minmax(450px,1.03fr) minmax(410px,.97fr);
 gap:26px;align-items:start;margin-top:18px}
 @media (max-width:1120px){.wrap{grid-template-columns:1fr}}
@@ -579,9 +588,6 @@ gap:26px;align-items:start;margin-top:18px}
 .seatgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(275px,1fr));gap:12px}
 
 .boardwrap{padding:6px 4px 2px}
-.boardwrap:before{content:"";position:absolute;left:50%;top:46%;width:76%;height:66%;
-transform:translate(-50%,-50%);pointer-events:none;filter:blur(26px);
-background:radial-gradient(closest-side,rgba(232,201,106,.11),transparent 72%)}
 .lastring{animation:ring 2s ease-out infinite}
 @keyframes ring{0%{opacity:.95}70%{opacity:.15}100%{opacity:.95}}
 
@@ -590,25 +596,25 @@ background:radial-gradient(closest-side,rgba(232,201,106,.11),transparent 72%)}
 .srow:before{content:"";position:absolute;left:0;top:11px;bottom:11px;width:2px;background:var(--seat)}
 .srow:last-child{border-bottom:1px solid var(--line)}
 .line{display:flex;align-items:center;gap:10px}
-.pos{font:600 11px Fraunces,serif;color:var(--faint);width:9px}
+.pos{font:600 11px Oswald,sans-serif;color:var(--faint);width:9px}
 .sname{font-weight:600;letter-spacing:-.01em;font-size:14.5px}
-.svp{margin-left:auto;font:600 21px/1 Fraunces,Georgia,serif;color:var(--gold)}
-.svp i{font:500 9px "IBM Plex Sans";font-style:normal;color:var(--faint);
+.svp{margin-left:auto;font:600 21px/1 Oswald,sans-serif;color:var(--gold)}
+.svp i{font:500 9px Oswald;font-style:normal;color:var(--faint);
 margin-left:3px;letter-spacing:.12em;text-transform:uppercase}
 /* the hand as five little resource cards, not five pills */
 .hand{display:inline-flex;align-items:center;gap:3px;margin-left:4px}
 .rc{position:relative;width:19px;height:25px;border-radius:3px;background:var(--c);
 display:flex;align-items:flex-end;justify-content:center;padding-bottom:2px;
-font:600 10px "IBM Plex Mono",monospace;color:#14140d;
-box-shadow:inset 0 -2px 0 rgba(0,0,0,.22),0 1px 2px rgba(0,0,0,.4)}
+font:600 10px "IBM Plex Mono",monospace;color:#14161a;
+}
 .rc:before{content:"";position:absolute;top:0;left:0;right:0;height:8px;
 border-radius:3px 3px 0 0;background:rgba(255,255,255,.2)}
 .rc.zero{opacity:.22}
 .held{margin-left:6px;font:500 11px "IBM Plex Mono",monospace;color:var(--dim)}
-.held.danger{color:#f0b9a0}
+.held.danger{color:#ffb59a}
 .devs{gap:5px;flex-wrap:wrap;margin-top:8px}
 .dv{font:500 10.5px/1.6 "IBM Plex Mono",monospace;padding:1px 7px;border-radius:5px;
-background:#241f14;color:var(--gold);border:1px solid #453a22}
+background:#2a2712;color:var(--gold);border:1px solid #5a4d18}
 .dv.spent{color:var(--faint);border-color:var(--line);background:transparent}
 .dv b{font-weight:600;margin-left:5px}
 .dv i{font-style:normal;opacity:.6;margin-left:4px}
@@ -622,7 +628,7 @@ letter-spacing:.01em;margin-top:7px;display:flex;flex-wrap:wrap;align-items:base
 .facts .warn{color:var(--warn)}
 
 .feed{position:relative;max-height:640px;overflow-y:auto;padding:2px 6px 2px 21px;
-scrollbar-width:thin;scrollbar-color:#33322a transparent}
+scrollbar-width:thin;scrollbar-color:#2b3038 transparent}
 .feed:before{content:"";position:absolute;left:4px;top:6px;bottom:6px;width:1px;background:var(--line)}
 .turnsep{display:flex;align-items:center;gap:10px;margin:17px 0 9px;
 font:500 10px "IBM Plex Mono",monospace;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)}
@@ -638,47 +644,46 @@ transform:rotate(45deg);outline:1.5px solid var(--gold);outline-offset:1.5px}
 .entry.key .act{color:var(--gold)}
 .entry.waiting .act{color:var(--warn)}
 .tele{font:400 11px "IBM Plex Mono",monospace;color:var(--faint);letter-spacing:.02em;margin-top:1px}
-.why{font:400 14px/1.5 Fraunces,Georgia,serif;font-style:italic;color:#b6b1a0;margin-top:4px}
+.why{font:400 14px/1.5 Barlow,sans-serif;font-style:italic;color:#aab2ba;margin-top:4px}
 .retry{display:inline-block;font:500 10px "IBM Plex Mono",monospace;color:var(--warn);
-background:#2c1e16;border:1px solid #5a3626;border-radius:999px;padding:1px 8px;
+background:#2e2119;border:1px solid #6b4230;border-radius:999px;padding:1px 8px;
 margin-left:8px;vertical-align:1px;cursor:help;text-transform:none;letter-spacing:.04em}
 
 .controls{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:16px}
 .controls input[type=range]{flex:1;min-width:190px;accent-color:var(--gold);height:3px}
-.btn{background:#211f16;color:var(--text);border:1px solid var(--line2);border-radius:8px;
-padding:5px 12px;font:500 12px "IBM Plex Sans";cursor:pointer;transition:.14s ease}
-.btn:hover{background:#2c2919;border-color:#4f4b36;transform:translateY(-1px)}
+.btn{background:#1d2026;color:var(--text);border:1px solid var(--line2);border-radius:8px;
+padding:5px 12px;font:500 12px Oswald;cursor:pointer;transition:.14s ease}
+.btn:hover{background:#23272e;border-color:#3a3f47;transform:translateY(-1px)}
 .btn:active{transform:none}
 .counter{font:500 12px "IBM Plex Mono",monospace;color:var(--dim)}
 .counter b{color:var(--text)}
 .winner{display:flex;align-items:baseline;gap:10px;margin-top:16px;
-font:600 19px Fraunces,Georgia,serif;color:var(--gold)}
-.winner .sub{font:500 10px "IBM Plex Sans";letter-spacing:.16em;text-transform:uppercase}
+font:600 19px Oswald,sans-serif;color:var(--gold)}
+.winner .sub{font:500 10px Oswald;letter-spacing:.16em;text-transform:uppercase}
 .legend{display:flex;flex-wrap:wrap;gap:15px;margin:8px 2px 0;
 font:400 11px "IBM Plex Mono",monospace;color:var(--dim)}
 .lg b{color:var(--text);font-weight:500;margin-left:3px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 
-h3{font:600 11px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.13em;
+h3{font:600 11px Oswald;text-transform:uppercase;letter-spacing:.13em;
 color:var(--faint);margin:20px 0 9px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:18px}
 .stat{border-left:2px solid var(--line2);padding-left:14px}
-.stat b{display:block;font:600 25px/1.2 Fraunces,Georgia,serif;color:var(--gold);
+.stat b{display:block;font:600 25px/1.2 Oswald,sans-serif;color:var(--gold);
 letter-spacing:-.01em}
 .stat span{display:block;font-size:12px;color:var(--dim);margin-top:2px}
 .barset{margin-bottom:6px}
 .bar{display:flex;align-items:center;gap:11px;margin:0 0 6px}
 .barname{width:150px;font-size:13px;flex:none}
-.bartrack{flex:1;height:7px;border-radius:4px;background:#24231a;overflow:hidden}
-.bartrack i{display:block;height:100%;border-radius:4px;
-background:linear-gradient(90deg,#6b5f2c,var(--gold))}
+.bartrack{flex:1;height:7px;border-radius:2px;background:var(--line);overflow:hidden}
+.bartrack i{display:block;height:100%;border-radius:2px;background:var(--gold)}
 .barval{width:74px;text-align:right;flex:none;
 font:500 11.5px "IBM Plex Mono",monospace;color:var(--dim);font-variant-numeric:tabular-nums}
 table{border-collapse:collapse;width:100%}
 td,th{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);font-size:13.5px}
 td:first-child,td.mono,td.spend{white-space:nowrap}
-th{font:500 10px "IBM Plex Sans";text-transform:uppercase;letter-spacing:.14em;color:var(--faint)}
-tbody tr:hover td,table tr:hover td{background:#1c1b13}
+th{font:500 10px Oswald;text-transform:uppercase;letter-spacing:.14em;color:var(--faint)}
+tbody tr:hover td,table tr:hover td{background:#1b1e24}
 
 /* first paint only — a live frame swaps innerHTML, and re-animating that flickers */
 @keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
@@ -991,10 +996,22 @@ def index_page():
         f"<td class='mono spend'>${r['cost']:.3f}</td></tr>"
         for r in board
     )
+    # older logs recorded only whole-decision wall clock; say so rather than
+    # letting a retry-heavy model look slow at answering
+    untimed = any(r.get("untimed") for r in board)
+    timing_col = "median decision" if untimed else "median move"
+    note = (
+        "<div class=sub style='margin-top:10px;font-size:13px'>"
+        "Timings are whole-decision wall clock &mdash; they include failed attempts and "
+        "backoff, not model latency alone. A model that retries often reads slower here "
+        "than it answers.</div>"
+        if untimed
+        else ""
+    )
     lb_table = (
         "<div class='card rise'><h2>models</h2><table><tr><th>model</th><th>wins</th>"
-        "<th>games</th><th>moves</th><th>retries</th><th>median move</th><th>spend</th></tr>"
-        f"{lb}</table></div>"
+        f"<th>games</th><th>moves</th><th>retries</th><th>{timing_col}</th><th>spend</th></tr>"
+        f"{lb}</table>{note}</div>"
         if board
         else ""
     )
@@ -1057,20 +1074,28 @@ def leaderboard():
                 except ValueError:
                     continue
                 s = stats.setdefault(
-                    row.get("model", "?"), {"moves": 0, "retries": 0, "seconds": [], "cost": 0.0}
+                    row.get("model", "?"),
+                    {"moves": 0, "retries": 0, "seconds": [], "cost": 0.0, "untimed": False},
                 )
                 if row.get("type") == "retry":
                     s["retries"] += 1
                     continue
                 s["moves"] += 1
-                s["seconds"].append(row.get("seconds", 0))
+                # `latency` is the answering call alone; `seconds` is the whole
+                # decision, retries and backoff sleeps included. Reporting the
+                # second as model speed inflates a flaky model several-fold.
+                if row.get("latency") is not None:
+                    s["seconds"].append(row["latency"])
+                else:
+                    s["seconds"].append(row.get("seconds", 0))
+                    s["untimed"] = True
                 if "cost_total" in row:  # per-move delta; older logs logged the running total
                     s["cost"] += row.get("cost_usd") or 0
                 else:
                     s["cost"] = max(s["cost"], row.get("cost_usd") or 0)
     rows = []
     for model in stats.keys() | games.keys() | wins.keys():
-        s = stats.get(model, {"moves": 0, "retries": 0, "seconds": [], "cost": 0.0})
+        s = stats.get(model, {"moves": 0, "retries": 0, "seconds": [], "cost": 0.0, "untimed": False})
         rows.append(
             {
                 "model": model,
@@ -1079,6 +1104,7 @@ def leaderboard():
                 "moves": s["moves"],
                 "retries": s["retries"],
                 "median_s": round(statistics.median(s["seconds"]), 1) if s["seconds"] else 0,
+                "untimed": s.get("untimed", False),
                 "cost": s["cost"],
             }
         )
